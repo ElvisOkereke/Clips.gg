@@ -1,0 +1,233 @@
+/* ClipLite — Design System */
+:root {
+  --bg: #1a1a2e;
+  --bg-card: #16213e;
+  --bg-input: #0f3460;
+  --accent: #e94560;
+  --accent-hover: #c73652;
+  --accent-green: #0f9b58;
+  --text: #e0e0e0;
+  --text-muted: #888;
+  --border: #2a2a4a;
+  --radius: 6px;
+  --shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  user-select: none;
+  overflow: hidden;
+}
+
+#root { width: 100vw; height: 100vh; display: flex; flex-direction: column; }
+
+/* Layout */
+.app { display: flex; flex-direction: column; height: 100vh; }
+
+.nav {
+  display: flex;
+  gap: 2px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+}
+
+.nav-btn {
+  padding: 6px 14px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: var(--radius) var(--radius) 0 0;
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.15s;
+}
+.nav-btn:hover { color: var(--text); background: var(--bg-input); }
+.nav-btn.active { color: var(--text); background: var(--bg); border-bottom: 2px solid var(--accent); }
+
+.view { flex: 1; overflow-y: auto; padding: 12px; }
+
+/* Form elements */
+.form-group { margin-bottom: 10px; }
+.form-label { display: block; font-size: 11px; color: var(--text-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.form-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.form-row .form-label { margin: 0; white-space: nowrap; min-width: 90px; }
+
+select, input[type="text"], input[type="number"] {
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+select:focus, input:focus { border-color: var(--accent); }
+select option { background: var(--bg-card); }
+
+/* Buttons */
+.btn {
+  padding: 7px 14px;
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.btn-primary { background: var(--accent); color: white; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-record { background: var(--accent); color: white; min-height: 36px; font-size: 14px; flex: 1; }
+.btn-record.recording { background: #333; border: 2px solid var(--accent); }
+.btn-record.recording:hover { background: #444; }
+.btn-secondary { background: var(--bg-input); color: var(--text); }
+.btn-secondary:hover { background: #1a3a6a; }
+.btn-danger { background: #8b2020; color: white; }
+.btn-danger:hover { background: #a02828; }
+.btn-sm { padding: 4px 10px; font-size: 11px; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Cards / Groups */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.card-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+/* Elapsed timer */
+.timer {
+  font-family: "Courier New", monospace;
+  font-size: 22px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--accent);
+  letter-spacing: 2px;
+  padding: 8px 0;
+}
+
+/* Volume bar */
+.volume-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.volume-fill {
+  height: 100%;
+  background: var(--accent-green);
+  border-radius: 3px;
+  transition: width 0.05s;
+}
+
+/* Status bar */
+.status-bar {
+  padding: 4px 12px;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Library grid */
+.library-search {
+  margin-bottom: 10px;
+}
+.clip-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.clip-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  transition: all 0.15s;
+  position: relative;
+}
+.clip-card:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: var(--shadow); }
+.clip-card.selected { border-color: var(--accent); }
+.clip-thumb {
+  width: 100%;
+  aspect-ratio: 16/9;
+  object-fit: cover;
+  background: #111;
+  display: block;
+}
+.clip-thumb-placeholder {
+  width: 100%;
+  aspect-ratio: 16/9;
+  background: #111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 20px;
+}
+.clip-info { padding: 6px; }
+.clip-name { font-size: 10px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.clip-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+
+.library-toolbar { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+
+/* Empty state */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  color: var(--text-muted);
+  gap: 8px;
+}
+.empty-icon { font-size: 40px; }
+
+/* Settings */
+.settings-section { margin-bottom: 16px; }
+.settings-section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 8px; }
+
+/* Checkbox */
+.checkbox-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: pointer; }
+.checkbox-row input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px; }
+
+/* Replay buffer button */
+.btn-replay { background: #1a1a4a; color: #8888ff; border: 1px solid #3333aa; }
+.btn-replay:hover { background: #2a2a6a; }
+.btn-replay.active { background: #6633aa; color: white; border-color: #9966ff; }
+
+/* Tooltip */
+[title] { cursor: help; }
+
+/* Replay saved toast animation */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateX(-50%) translateY(12px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #444; }
