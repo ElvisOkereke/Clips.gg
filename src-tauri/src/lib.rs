@@ -5,38 +5,88 @@ mod library;
 mod settings;
 mod ffmpeg;
 mod tray;
+mod hotkey_listener;
 
 use std::sync::Mutex;
-use tauri::{Manager, Emitter};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri::Manager;
 
 /// Cached hardware encoder name, detected once at startup.
 #[derive(Default)]
 pub struct EncoderCache(pub Mutex<String>);
 
+/// Handle to the global hotkey listener thread — wrapped in Option so it can be replaced.
+pub struct HotkeyListenerHandle(pub Mutex<Option<hotkey_listener::HotkeyListener>>);
+
+impl Default for HotkeyListenerHandle {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+/// Initialize logging to file and set up panic hook.
+fn setup_logging() {
+    let log_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cliplite/debug.log");
+
+    // Create directory if needed
+    let log_dir = log_path.parent();
+    if let Some(dir) = log_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    // Truncate on each launch so it stays readable
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            env_logger::Builder::new()
+                .target(env_logger::Target::Pipe(Box::new(file)))
+                .filter_level(log::LevelFilter::Debug)
+                .format_timestamp_millis()
+                .init();
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not open log file: {e}");
+        }
+    }
+
+    // Set panic hook to write to log file
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("[PANIC] {:?}", info);
+        log::error!("{msg}");
+        
+        let log_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".cliplite/debug.log");
+        
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{msg}");
+        }
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn")
-    ).init();
+    setup_logging();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
-                    if event.state() != ShortcutState::Pressed { return; }
-                    handle_shortcut(app, shortcut);
-                })
-                .build()
-        )
         .plugin(tauri_plugin_notification::init())
         .manage(recorder::RecorderState::default())
         .manage(library::LibraryState::default())
         .manage(settings::SettingsState::default())
         .manage(EncoderCache::default())
+        .manage(HotkeyListenerHandle::default())
         .invoke_handler(tauri::generate_handler![
             commands::find_ffmpeg,
             commands::detect_hw_encoder,
@@ -61,6 +111,8 @@ pub fn run() {
             commands::open_path,
             commands::trim_clip,
             commands::generate_thumbnail,
+            commands::get_debug_state,
+            commands::simulate_hotkey,
         ])
         .setup(|app| {
             library::init_db().expect("Failed to initialize database");
@@ -70,8 +122,12 @@ pub fn run() {
 
             tray::setup_tray(app)?;
 
-            // Register hotkeys from settings
-            register_hotkeys(app, &settings.hotkeys)?;
+            // Start hotkey listener with global-hotkey crate
+            let listener = hotkey_listener::HotkeyListener::start(
+                app.handle().clone(),
+                settings.hotkeys.clone(),
+            );
+            *app.state::<HotkeyListenerHandle>().0.lock().unwrap() = Some(listener);
 
             // Detect hardware encoder once at startup
             let app_handle = app.handle().clone();
@@ -88,6 +144,8 @@ pub fn run() {
 
             if let Some(win) = app.get_webview_window("main") {
                 win.show().ok();
+                #[cfg(debug_assertions)]
+                win.open_devtools();
             }
             Ok(())
         })
@@ -109,143 +167,26 @@ pub fn run() {
         });
 }
 
-/// Register all hotkeys from the settings map.
-fn register_hotkeys(
-    app: &mut tauri::App,
-    hotkeys: &std::collections::HashMap<String, String>,
-) -> anyhow::Result<()> {
-    for (action, key_str) in hotkeys {
-        if key_str.is_empty() { continue; }
-        if let Ok(shortcut) = parse_shortcut(key_str) {
-            if let Err(e) = app.global_shortcut().register(shortcut) {
-                log::warn!("Failed to register hotkey '{key_str}' for '{action}': {e}");
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Re-register all hotkeys from an AppHandle (used after settings are saved).
-/// Unregisters each known shortcut individually before re-registering.
+/// Re-register all hotkeys using the new global-hotkey listener.
+/// This replaces the old Tauri plugin-based approach.
 pub fn reregister_hotkeys(
     app:     &tauri::AppHandle,
     hotkeys: &std::collections::HashMap<String, String>,
 ) {
-    let gs = app.global_shortcut();
-
-    // Unregister existing shortcuts one-by-one (unregister_all is unreliable on Windows)
-    for key_str in hotkeys.values() {
-        if key_str.is_empty() { continue; }
-        if let Ok(shortcut) = parse_shortcut(key_str) {
-            let _ = gs.unregister(shortcut);
+    // Stop the old listener if it exists
+    if let Ok(mut handle) = app.state::<HotkeyListenerHandle>().0.lock() {
+        if let Some(listener) = handle.take() {
+            listener.stop_and_wait();
         }
     }
 
-    // Re-register with new bindings
-    for (action, key_str) in hotkeys {
-        if key_str.is_empty() { continue; }
-        if let Ok(shortcut) = parse_shortcut(key_str) {
-            if let Err(e) = gs.register(shortcut) {
-                log::warn!("Failed to register hotkey '{key_str}' for '{action}': {e}");
-            }
-        }
-    }
-}
+    // Start a new listener with the updated hotkeys
+    let listener = hotkey_listener::HotkeyListener::start(
+        app.clone(),
+        hotkeys.clone(),
+    );
 
-/// Parse a shortcut string like "CommandOrControl+Shift+R" into a Shortcut.
-pub fn parse_shortcut(s: &str) -> Result<Shortcut, String> {
-    let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
-    let mut mods = Modifiers::empty();
-    let mut code = None;
-
-    for part in &parts {
-        match *part {
-            "CommandOrControl" | "CmdOrCtrl" | "Ctrl" | "Control" => {
-                mods |= Modifiers::CONTROL;
-            }
-            "Shift" => { mods |= Modifiers::SHIFT; }
-            "Alt"   => { mods |= Modifiers::ALT; }
-            "Meta" | "Cmd" | "Super" => { mods |= Modifiers::META; }
-            key => {
-                code = Some(str_to_code(key)?);
-            }
-        }
-    }
-
-    let c = code.ok_or_else(|| format!("No key in '{s}'"))?;
-    Ok(Shortcut::new(Some(mods), c))
-}
-
-/// Convert a key name string to a Code.
-fn str_to_code(s: &str) -> Result<Code, String> {
-    match s.to_uppercase().as_str() {
-        "A" => Ok(Code::KeyA), "B" => Ok(Code::KeyB), "C" => Ok(Code::KeyC),
-        "D" => Ok(Code::KeyD), "E" => Ok(Code::KeyE), "F" => Ok(Code::KeyF),
-        "G" => Ok(Code::KeyG), "H" => Ok(Code::KeyH), "I" => Ok(Code::KeyI),
-        "J" => Ok(Code::KeyJ), "K" => Ok(Code::KeyK), "L" => Ok(Code::KeyL),
-        "M" => Ok(Code::KeyM), "N" => Ok(Code::KeyN), "O" => Ok(Code::KeyO),
-        "P" => Ok(Code::KeyP), "Q" => Ok(Code::KeyQ), "R" => Ok(Code::KeyR),
-        "S" => Ok(Code::KeyS), "T" => Ok(Code::KeyT), "U" => Ok(Code::KeyU),
-        "V" => Ok(Code::KeyV), "W" => Ok(Code::KeyW), "X" => Ok(Code::KeyX),
-        "Y" => Ok(Code::KeyY), "Z" => Ok(Code::KeyZ),
-        "0" => Ok(Code::Digit0), "1" => Ok(Code::Digit1), "2" => Ok(Code::Digit2),
-        "3" => Ok(Code::Digit3), "4" => Ok(Code::Digit4), "5" => Ok(Code::Digit5),
-        "6" => Ok(Code::Digit6), "7" => Ok(Code::Digit7), "8" => Ok(Code::Digit8),
-        "9" => Ok(Code::Digit9),
-        "F1"  => Ok(Code::F1),  "F2"  => Ok(Code::F2),  "F3"  => Ok(Code::F3),
-        "F4"  => Ok(Code::F4),  "F5"  => Ok(Code::F5),  "F6"  => Ok(Code::F6),
-        "F7"  => Ok(Code::F7),  "F8"  => Ok(Code::F8),  "F9"  => Ok(Code::F9),
-        "F10" => Ok(Code::F10), "F11" => Ok(Code::F11), "F12" => Ok(Code::F12),
-        "SPACE" => Ok(Code::Space),
-        "ENTER" | "RETURN" => Ok(Code::Enter),
-        "TAB"   => Ok(Code::Tab),
-        "ESCAPE" | "ESC" => Ok(Code::Escape),
-        _ => Err(format!("Unknown key: {s}")),
-    }
-}
-
-/// Called by the global shortcut handler for every registered shortcut press.
-fn handle_shortcut(app: &tauri::AppHandle, shortcut: &Shortcut) {
-    let settings = app.state::<settings::SettingsState>();
-    let hotkeys  = settings.0.lock().unwrap().hotkeys.clone();
-
-    // Find which action this shortcut corresponds to
-    let action = hotkeys.iter().find_map(|(action, key_str)| {
-        parse_shortcut(key_str).ok().and_then(|s| {
-            if s.mods == shortcut.mods && s.key == shortcut.key {
-                Some(action.clone())
-            } else {
-                None
-            }
-        })
-    });
-
-    let Some(action) = action else { return };
-
-    match action.as_str() {
-        "start" => {
-            // Emit event to frontend to start recording
-            app.emit("hotkey-start-recording", ()).ok();
-        }
-        "stop" => {
-            app.emit("hotkey-stop-recording", ()).ok();
-        }
-        "pause" => {
-            app.emit("hotkey-pause-recording", ()).ok();
-        }
-        "library" => {
-            if let Some(win) = app.get_webview_window("main") {
-                win.show().ok();
-                win.set_focus().ok();
-            }
-            app.emit("hotkey-open-library", ()).ok();
-        }
-        "replay_toggle" => {
-            app.emit("hotkey-replay-toggle", ()).ok();
-        }
-        "replay_save" => {
-            app.emit("hotkey-replay-save", ()).ok();
-        }
-        _ => {}
+    if let Ok(mut handle) = app.state::<HotkeyListenerHandle>().0.lock() {
+        *handle = Some(listener);
     }
 }
