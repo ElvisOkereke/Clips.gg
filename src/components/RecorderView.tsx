@@ -61,6 +61,18 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
   const pausedDurRef  = useRef<number>(0);
   const pauseStartRef = useRef<number>(0);
 
+  // Store state and handlers in refs so hotkey listeners always use the latest versions
+  const stateRef = useRef({ isRecording, isPaused, busy, replayActive, replayBusy, replayIdx });
+  const handleRecordRef      = useRef<() => Promise<void>>(() => Promise.resolve());
+  const handlePauseResumeRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  const handleReplayToggleRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  const handleSaveReplayRef  = useRef<() => Promise<void>>(() => Promise.resolve());
+  const listenersReadyRef = useRef(false);
+
+  useEffect(() => {
+    stateRef.current = { isRecording, isPaused, busy, replayActive, replayBusy, replayIdx };
+  }, [isRecording, isPaused, busy, replayActive, replayBusy, replayIdx]);
+
   // ── Load devices on mount — no detectHwEncoder here (that spawns FFmpeg) ──
   // hwEncoder is passed from App where it's cached at startup.
   useEffect(() => {
@@ -130,17 +142,63 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
   }, [isRecording]);
 
   // ── Global hotkey listeners (events fired by lib.rs shortcut handler) ──────
+  // Set up listeners AFTER the ref update effect has run to ensure handlers are available
   useEffect(() => {
-    const unlisteners = [
-      listen("hotkey-start-recording", () => { if (!isRecording && !busy) handleRecord(); }),
-      listen("hotkey-stop-recording",  () => { if ( isRecording && !busy) handleRecord(); }),
-      listen("hotkey-pause-recording", () => handlePauseResume()),
-      listen("hotkey-replay-toggle",   () => handleReplayToggle()),
-      listen("hotkey-replay-save",     () => handleSaveReplay()),
-    ];
-    return () => { unlisteners.forEach(u => u.then(f => f())); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isRecording, isPaused, busy, replayActive, replayBusy, replayIdx]);
+    // Wait a microtask for the handler update effect to run
+    const setupListeners = async () => {
+      let mounted = true;
+      const unlistenFns: (() => void)[] = [];
+
+      try {
+        // Set up listeners that call the latest handler via ref
+        const unlisten1 = await listen("hotkey-start-recording", () => {
+          const s = stateRef.current;
+          if (!s.isRecording && !s.busy) handleRecordRef.current();
+        });
+        if (mounted) unlistenFns.push(unlisten1);
+
+        const unlisten2 = await listen("hotkey-stop-recording", () => {
+          const s = stateRef.current;
+          if (s.isRecording && !s.busy) handleRecordRef.current();
+        });
+        if (mounted) unlistenFns.push(unlisten2);
+
+        const unlisten3 = await listen("hotkey-pause-recording", () => {
+          handlePauseResumeRef.current();
+        });
+        if (mounted) unlistenFns.push(unlisten3);
+
+        const unlisten4 = await listen("hotkey-replay-toggle", () => {
+          handleReplayToggleRef.current();
+        });
+        if (mounted) unlistenFns.push(unlisten4);
+
+        const unlisten5 = await listen("hotkey-replay-save", () => {
+          handleSaveReplayRef.current();
+        });
+        if (mounted) unlistenFns.push(unlisten5);
+        
+        listenersReadyRef.current = true;
+
+        return () => {
+          mounted = false;
+          unlistenFns.forEach(fn => fn());
+        };
+      } catch (err) {
+        console.error("Failed to set up hotkey listeners:", err);
+        return () => {};
+      }
+    };
+
+    let cleanup: (() => void) | null = null;
+    
+    // Allow handler update effect to run first via a microtask
+    Promise.resolve().then(() => {
+      setupListeners().then(c => { cleanup = c; });
+    });
+
+    return () => { cleanup?.(); };
+  }, []);
 
   const elapsedStr = useCallback((secs: number) => {
     const h = Math.floor(secs / 3600);
@@ -250,7 +308,15 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
     } catch (e: any) {
       onStatus(`Replay save error: ${e}`);
     } finally { setReplayBusy(false); }
-  };
+   };
+
+  // Update handler refs so hotkey listeners always call the latest versions
+  useEffect(() => {
+    handleRecordRef.current      = handleRecord;
+    handlePauseResumeRef.current = handlePauseResume;
+    handleReplayToggleRef.current = handleReplayToggle;
+    handleSaveReplayRef.current  = handleSaveReplay;
+  }, [handleRecord, handlePauseResume, handleReplayToggle, handleSaveReplay]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
