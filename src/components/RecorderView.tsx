@@ -71,13 +71,17 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
   const loadDevices = () => {
     listAudioDevices().then(devs => {
       setMicDevices(devs);
-      // Restore saved mic selection or pick first real mic
+      // Restore saved mic selection or auto-select first available
       const savedId = settings.mic_device_id;
       if (savedId && devs.find(d => d.id === savedId)) {
+        // Restore previously selected mic
         setMicDeviceId(savedId);
         setMicDevice(devs.find(d => d.id === savedId)?.name ?? null);
       } else if (devs.length > 0) {
-        // Don't auto-select — leave as None unless user chooses
+        // Auto-select first available microphone to ensure audio is captured
+        const firstMic = devs[0];
+        setMicDeviceId(firstMic.id);
+        setMicDevice(firstMic.name);
       }
     }).catch(() => {});
 
