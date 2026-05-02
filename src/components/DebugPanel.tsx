@@ -17,12 +17,12 @@ interface HotkeyEvent {
 // Maps the short action key (used by simulate buttons) to the full event name
 // that the backend emits and the frontend listens for.
 const ACTION_TO_EVENT: Record<string, string> = {
-  "start-recording":  "hotkey-start-recording",
-  "stop-recording":   "hotkey-stop-recording",
-  "pause-recording":  "hotkey-pause-recording",
-  "open-library":     "hotkey-open-library",
-  "replay-toggle":    "hotkey-replay-toggle",
-  "replay-save":      "hotkey-replay-save",
+  "start":            "hotkey-start-recording",
+  "stop":             "hotkey-stop-recording",
+  "pause":            "hotkey-pause-recording",
+  "library":          "hotkey-open-library",
+  "replay_toggle":    "hotkey-replay-toggle",
+  "replay_save":      "hotkey-replay-save",
 };
 
 export function DebugPanel() {
