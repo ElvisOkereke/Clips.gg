@@ -2,7 +2,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     audio, ffmpeg,
@@ -927,4 +927,86 @@ fn fmt_time(s: f64) -> String {
     let m = ((s % 3600.0) / 60.0) as u64;
     let sec = s % 60.0;
     format!("{h:02}:{m:02}:{sec:06.3}")
+}
+
+// ── Debug commands ────────────────────────────────────────────────────────────
+
+/// Expose full internal state for debugging.
+#[tauri::command]
+pub fn get_debug_state(
+    hotkey_handle: State<'_, crate::HotkeyListenerHandle>,
+    settings: State<'_, SettingsState>,
+    recorder: State<'_, RecorderState>,
+) -> serde_json::Value {
+    let hotkeys = settings.0.lock().unwrap().hotkeys.clone();
+    let is_recording = recorder.0.lock().unwrap().status().is_recording;
+    let listener_alive = hotkey_handle.0.lock().unwrap().is_some();
+    
+    serde_json::json!({
+        "hotkeys": hotkeys,
+        "listener_alive": listener_alive,
+        "is_recording": is_recording,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Simulate a hotkey event directly (useful for testing).
+/// Bypasses the OS hotkey system entirely, goes straight to the event emitter.
+#[tauri::command]
+pub fn simulate_hotkey(app: AppHandle, action: String) -> Result<(), String> {
+    let event = format!("hotkey-{action}");
+    log::info!("[debug] Simulating hotkey event: {event}");
+    // Target the main window directly — same path as the real hotkey listener.
+    if let Some(win) = app.get_webview_window("main") {
+        win.emit(&event, ()).map_err(|e| e.to_string())
+    } else {
+        app.emit(&event, ()).map_err(|e| e.to_string())
+    }
+}
+
+/// Handle a hotkey action - called by the backend hotkey listener.
+/// This routes the hotkey to the appropriate handler.
+#[tauri::command]
+pub fn handle_hotkey(app: AppHandle, action: String) -> Result<(), String> {
+    log::info!("[hotkey] Handling action: {action}");
+    
+    match action.as_str() {
+        "start-recording" => {
+            log::info!("[hotkey] Start recording");
+            app.emit("hotkey-start-recording", ()).ok();
+        }
+        "stop-recording" => {
+            log::info!("[hotkey] Stop recording");
+            app.emit("hotkey-stop-recording", ()).ok();
+        }
+        "pause-recording" => {
+            log::info!("[hotkey] Pause recording");
+            app.emit("hotkey-pause-recording", ()).ok();
+        }
+        "open-library" => {
+            log::info!("[hotkey] Open library");
+            if let Some(win) = app.get_webview_window("main") {
+                win.show().ok();
+                win.set_focus().ok();
+            }
+            app.emit("hotkey-open-library", ()).ok();
+        }
+        "replay-toggle" => {
+            log::info!("[hotkey] Toggle replay");
+            app.emit("hotkey-replay-toggle", ()).ok();
+        }
+        "replay-save" => {
+            log::info!("[hotkey] Save replay");
+            app.emit("hotkey-replay-save", ()).ok();
+        }
+        "annotate" => {
+            log::info!("[hotkey] Annotate");
+            app.emit("hotkey-annotate", ()).ok();
+        }
+        _ => {
+            log::warn!("[hotkey] Unknown action: {action}");
+        }
+    }
+    
+    Ok(())
 }

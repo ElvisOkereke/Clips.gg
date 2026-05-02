@@ -129,18 +129,14 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
     return () => { clearTimeout(warmup); clearInterval(pollRef.current); };
   }, [isRecording]);
 
-  // ── Global hotkey listeners (events fired by lib.rs shortcut handler) ──────
-  useEffect(() => {
-    const unlisteners = [
-      listen("hotkey-start-recording", () => { if (!isRecording && !busy) handleRecord(); }),
-      listen("hotkey-stop-recording",  () => { if ( isRecording && !busy) handleRecord(); }),
-      listen("hotkey-pause-recording", () => handlePauseResume()),
-      listen("hotkey-replay-toggle",   () => handleReplayToggle()),
-      listen("hotkey-replay-save",     () => handleSaveReplay()),
-    ];
-    return () => { unlisteners.forEach(u => u.then(f => f())); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isRecording, isPaused, busy, replayActive, replayBusy, replayIdx]);
+  // ── Global hotkey refs ────────────────────────────────────────────────────
+  // Handlers are defined later in the file, so initialize refs with no-ops.
+  // They are updated on every render via the useEffect blocks below, so
+  // the listener callbacks always invoke the current handler with current state.
+  const handleRecordRef       = useRef<() => void>(() => {});
+  const handlePauseResumeRef  = useRef<() => void>(() => {});
+  const handleReplayToggleRef = useRef<() => void>(() => {});
+  const handleSaveReplayRef   = useRef<() => void>(() => {});
 
   const elapsedStr = useCallback((secs: number) => {
     const h = Math.floor(secs / 3600);
@@ -251,6 +247,43 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
       onStatus(`Replay save error: ${e}`);
     } finally { setReplayBusy(false); }
   };
+
+  // ── Keep hotkey refs pointing at latest handlers (runs after every render) ─
+  // This is a synchronous assignment, not a useEffect, so refs are always
+  // current before any event handler could fire.
+  handleRecordRef.current       = handleRecord;
+  handlePauseResumeRef.current  = handlePauseResume;
+  handleReplayToggleRef.current = handleReplayToggle;
+  handleSaveReplayRef.current   = handleSaveReplay;
+
+  // ── Register hotkey listeners exactly once on mount ───────────────────────
+  useEffect(() => {
+    console.log("[hotkeys] Registering listeners...");
+    const events = [
+      "hotkey-start-recording",
+      "hotkey-stop-recording",
+      "hotkey-pause-recording",
+      "hotkey-replay-toggle",
+      "hotkey-replay-save",
+    ] as const;
+
+    const handlers: Record<string, () => void> = {
+      "hotkey-start-recording": () => { console.log("[hotkeys] start-recording fired"); handleRecordRef.current(); },
+      "hotkey-stop-recording":  () => { console.log("[hotkeys] stop-recording fired");  handleRecordRef.current(); },
+      "hotkey-pause-recording": () => { console.log("[hotkeys] pause-recording fired"); handlePauseResumeRef.current(); },
+      "hotkey-replay-toggle":   () => { console.log("[hotkeys] replay-toggle fired");   handleReplayToggleRef.current(); },
+      "hotkey-replay-save":     () => { console.log("[hotkeys] replay-save fired");     handleSaveReplayRef.current(); },
+    };
+
+    const promises = events.map(name =>
+      listen(name, () => handlers[name]())
+        .then(unlisten => { console.log(`[hotkeys] ✓ registered ${name}`); return unlisten; })
+        .catch(err => { console.error(`[hotkeys] ✗ FAILED to register ${name}:`, err); return () => {}; })
+    );
+
+    return () => { promises.forEach(p => p.then(f => f())); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (

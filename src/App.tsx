@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { RecorderView } from "./components/RecorderView";
 import { LibraryView } from "./components/LibraryView";
 import { SettingsView } from "./components/SettingsView";
+import { DebugPanel } from "./components/DebugPanel";
 import { getSettings, saveSettings, applyHotkeys, detectHwEncoder } from "./api";
 import type { Settings, View } from "./types";
 
@@ -157,6 +158,9 @@ export default function App() {
           onDone={() => setReplayToast(null)}
         />
       )}
+
+      {/* Debug Panel — always available in bottom-right */}
+      <DebugPanel />
     </div>
   );
 }
