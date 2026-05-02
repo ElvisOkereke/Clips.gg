@@ -11,6 +11,18 @@ pub fn build_record_command(
     output_path:      &str,
     sys_audio_format: Option<&crate::audio::AudioFormat>,
 ) -> Vec<String> {
+    build_record_command_with_pipe(ffmpeg, region, audio_cfg, enc_cfg, output_path, sys_audio_format, r"\\.\pipe\cliplite_sysaudio")
+}
+
+pub fn build_record_command_with_pipe(
+    ffmpeg:           &Path,
+    region:           &Region,
+    audio_cfg:        &AudioConfig,
+    enc_cfg:          &EncConfig,
+    output_path:      &str,
+    sys_audio_format: Option<&crate::audio::AudioFormat>,
+    pipe_name:        &str,
+) -> Vec<String> {
     let mut cmd = vec![ffmpeg.to_string_lossy().into_owned(), "-y".into()];
 
     let enc     = enc_cfg.hw_encoder.as_str();
@@ -38,7 +50,7 @@ pub fn build_record_command(
             "-ar".into(), rate.to_string(),
             "-ac".into(), ch.to_string(),
             "-thread_queue_size".into(), "4096".into(),
-            "-i".into(), r"\\.\pipe\cliplite_sysaudio".into(),
+            "-i".into(), pipe_name.to_string(),
         ]);
     }
 

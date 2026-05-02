@@ -56,6 +56,7 @@ export interface RecordingStatus {
   is_paused: boolean;
   elapsed_seconds: number;
   output_path: string | null;
+  replay_active: boolean;
 }
 
 export interface Settings {

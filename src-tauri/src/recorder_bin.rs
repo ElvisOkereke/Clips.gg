@@ -36,6 +36,10 @@ pub struct StartArgs {
     pub region:       Region,
     pub audio_cfg:    AudioConfig,
     pub enc_cfg:      EncConfig,
+    /// Named pipe for audio. Recording uses cliplite_sysaudio, replay uses cliplite_sysaudio_replay.
+    /// If absent, defaults to cliplite_sysaudio.
+    #[serde(default)]
+    pub audio_pipe:   Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,18 +78,23 @@ fn emit(event: &Event) {
 }
 
 /// Start a recording with optional extra FFmpeg args inserted before the output path.
+/// Uses args.audio_pipe to determine which named pipe to use (recording vs replay).
 
 fn do_start_with_extra(
     rec: &mut recorder::RecorderInner,
     args: StartArgs,
     extra: &[&str],
 ) -> Result<String, String> {
+    let pipe = args.audio_pipe.clone()
+        .unwrap_or_else(|| r"\\.\pipe\cliplite_sysaudio".to_string());
+
     #[cfg(windows)]
     {
         let sys_id = args.audio_cfg.sys_device_id.clone();
         let mic_id = args.audio_cfg.mic_device_id.clone();
         if sys_id.is_some() || mic_id.is_some() {
-            match audio::SysAudioCapture::start(sys_id, mic_id) {
+            let result = audio::SysAudioCapture::start_with_pipe(sys_id, mic_id, pipe.clone());
+            match result {
                 Ok(cap) => rec.sys_audio = Some(cap),
                 Err(e)  => eprintln!("[recorder] audio failed: {e}"),
             }
@@ -95,13 +104,14 @@ fn do_start_with_extra(
         #[cfg(windows)]      { rec.sys_audio.as_ref().map(|c| c.format.clone()) }
         #[cfg(not(windows))] { None::<audio::AudioFormat> }
     };
-    let mut cmd_args = ffmpeg::build_record_command(
+    let mut cmd_args = ffmpeg::build_record_command_with_pipe(
         std::path::Path::new(&args.ffmpeg_path),
         &args.region,
         &args.audio_cfg,
         &args.enc_cfg,
         &args.output_path,
         sys_fmt.as_ref(),
+        &pipe,
     );
     // Insert extra args before the output path (last element)
     if !extra.is_empty() {
@@ -116,12 +126,16 @@ fn do_start_with_extra(
 }
 
 fn do_start(rec: &mut recorder::RecorderInner, args: StartArgs) -> Result<String, String> {
+    let pipe = args.audio_pipe.clone()
+        .unwrap_or_else(|| r"\\.\pipe\cliplite_sysaudio".to_string());
+
     #[cfg(windows)]
     {
         let sys_id = args.audio_cfg.sys_device_id.clone();
         let mic_id = args.audio_cfg.mic_device_id.clone();
         if sys_id.is_some() || mic_id.is_some() {
-            match audio::SysAudioCapture::start(sys_id, mic_id) {
+            let result = audio::SysAudioCapture::start_with_pipe(sys_id, mic_id, pipe.clone());
+            match result {
                 Ok(cap) => rec.sys_audio = Some(cap),
                 Err(e)  => eprintln!("[recorder] audio failed: {e}"),
             }
@@ -133,13 +147,14 @@ fn do_start(rec: &mut recorder::RecorderInner, args: StartArgs) -> Result<String
         #[cfg(not(windows))]  { None::<audio::AudioFormat> }
     };
 
-    let cmd_args = ffmpeg::build_record_command(
+    let cmd_args = ffmpeg::build_record_command_with_pipe(
         std::path::Path::new(&args.ffmpeg_path),
         &args.region,
         &args.audio_cfg,
         &args.enc_cfg,
         &args.output_path,
         sys_fmt.as_ref(),
+        &pipe,
     );
 
     let path = args.output_path.clone();
@@ -211,13 +226,8 @@ fn main() {
                 // Store ffmpeg path for use in SaveReplay
                 *replay_ffmpeg_path.lock().unwrap() = args.ffmpeg_path.clone();
 
-                // Use MKV (not MP4) as temp format.
-                // MKV has no moov atom requirement so it is readable/seekable
-                // while FFmpeg is still writing — MP4 is not (moov written at end).
-                //
-                // IMPORTANT: std::env::temp_dir() on Windows may return an 8.3
-                // short path (e.g. C:\Users\AHEEEE~1\...) which FFmpeg cannot read.
-                // Use USERPROFILE env var to get the full long path.
+                // Use MKV (not MP4) as temp format — readable while FFmpeg writes.
+                // Use USERPROFILE to avoid 8.3 short paths on Windows.
                 let tmp_dir = std::env::var("USERPROFILE")
                     .map(|p| std::path::PathBuf::from(p)
                         .join("AppData").join("Local").join("Temp"))
@@ -227,25 +237,11 @@ fn main() {
                 let tmp_str = tmp.to_string_lossy().to_string();
                 *replay_path.lock().unwrap() = tmp_str.clone();
 
-                // Build a modified AudioConfig with no audio if main recording is active
-                // (the named pipe is already in use by the main recording's WASAPI capture)
-                let is_main_recording = state.lock().unwrap().status().is_recording;
-                let audio_cfg_for_replay = if is_main_recording {
-                    // No audio for replay when main recording is running —
-                    // avoids conflicting with the existing named pipe
-                    AudioConfig {
-                        mic_device:    None,
-                        sys_device_id: None,
-                        mic_device_id: None,
-                    }
-                } else {
-                    args.audio_cfg.clone()
-                };
-
+                // This subprocess is always dedicated to replay — no shared-pipe conflict.
+                // audio_pipe is set to cliplite_sysaudio_replay by the parent process.
                 let fps = args.enc_cfg.fps;
                 let replay_args = StartArgs {
                     output_path: tmp_str.clone(),
-                    audio_cfg:   audio_cfg_for_replay,
                     ..args
                 };
                 let mut rr = replay_state.lock().unwrap();

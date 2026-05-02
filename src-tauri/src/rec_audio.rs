@@ -28,6 +28,14 @@ pub struct SysAudioCapture {
 #[cfg(windows)]
 impl SysAudioCapture {
     pub fn start(sys_device_id: Option<String>, mic_device_id: Option<String>) -> Result<Self> {
+        Self::start_with_pipe(sys_device_id, mic_device_id, r"\\.\pipe\cliplite_sysaudio".into())
+    }
+
+    pub fn start_replay(sys_device_id: Option<String>, mic_device_id: Option<String>) -> Result<Self> {
+        Self::start_with_pipe(sys_device_id, mic_device_id, r"\\.\pipe\cliplite_sysaudio_replay".into())
+    }
+
+    pub fn start_with_pipe(sys_device_id: Option<String>, mic_device_id: Option<String>, pipe_name: String) -> Result<Self> {
         use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
         let stop   = Arc::new(AtomicBool::new(false));
@@ -38,7 +46,7 @@ impl SysAudioCapture {
         let thread = std::thread::Builder::new()
             .name("sys-audio".into())
             .spawn(move || {
-                if let Err(e) = capture_loop(sys_device_id.as_deref(), mic_device_id.as_deref(), &stop2, &ready2) {
+                if let Err(e) = capture_loop(sys_device_id.as_deref(), mic_device_id.as_deref(), &pipe_name, &stop2, &ready2) {
                     eprintln!("[recorder audio] {e}");
                     *ready2.lock().unwrap() = Some(AudioFormat {
                         sample_rate: PIPE_SAMPLE_RATE,
@@ -176,6 +184,7 @@ unsafe fn drain_wasapi(
 fn capture_loop(
     sys_device_id: Option<&str>,
     mic_device_id: Option<&str>,
+    pipe_name_str: &str,
     stop:  &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ready: &std::sync::Arc<std::sync::Mutex<Option<AudioFormat>>>,
 ) -> Result<()> {
@@ -212,8 +221,8 @@ fn capture_loop(
         .or_else(|| mic.as_ref().map(|(_, _, ev)| *ev))
         .unwrap();
 
-    // Create named pipe
-    let pipe_name: Vec<u16> = OsStr::new(r"\\.\pipe\cliplite_sysaudio")
+    // Create named pipe (name is passed in so recording and replay can use separate pipes)
+    let pipe_name: Vec<u16> = OsStr::new(pipe_name_str)
         .encode_wide().chain([0]).collect();
     let pipe = unsafe {
         let h = CreateNamedPipeW(

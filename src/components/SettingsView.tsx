@@ -8,10 +8,13 @@ interface Props {
   onSave: (s: Settings) => void;
 }
 
-/** Convert a KeyboardEvent into a hotkey string like "CommandOrControl+Shift+R". */
+/** Convert a KeyboardEvent into a hotkey string like "CommandOrControl+Shift+R".
+ *  Key names must match what the Rust `parse_hotkey()` function in hotkey_listener.rs expects.
+ */
 function keyEventToHotkeyString(e: React.KeyboardEvent<HTMLInputElement>): string | null {
-  // Ignore bare modifier keys
-  if (["Control", "Shift", "Alt", "Meta", "CapsLock", "NumLock", "ScrollLock"].includes(e.key)) {
+  // Ignore bare modifier keys — they can't be hotkeys on their own
+  if (["Control", "Shift", "Alt", "Meta", "CapsLock", "NumLock", "ScrollLock",
+       "ContextMenu", "OS", "Dead", "Unidentified"].includes(e.key)) {
     return null;
   }
 
@@ -20,17 +23,62 @@ function keyEventToHotkeyString(e: React.KeyboardEvent<HTMLInputElement>): strin
   if (e.shiftKey)             parts.push("Shift");
   if (e.altKey)               parts.push("Alt");
 
-  // Map key to the format the Rust parser expects
-  let keyName = e.code; // e.g. "KeyR", "Digit1", "F5", "Space"
-  if (keyName.startsWith("Key"))   keyName = keyName.slice(3);          // "KeyR" → "R"
-  if (keyName.startsWith("Digit")) keyName = keyName.slice(5);          // "Digit1" → "1"
-  if (keyName === "Space")         keyName = "Space";
-  if (keyName === "Enter")         keyName = "Enter";
-  if (keyName === "Tab")           keyName = "Tab";
-  if (keyName === "Escape")        keyName = "Escape";
+  // Map e.code → Rust parser's expected key name
+  const code = e.code;
 
-  parts.push(keyName);
-  return parts.join("+");
+  // Letters: "KeyA" → "A"
+  if (code.startsWith("Key")) { parts.push(code.slice(3)); return parts.join("+"); }
+  // Digits: "Digit1" → "1"
+  if (code.startsWith("Digit")) { parts.push(code.slice(5)); return parts.join("+"); }
+  // Function keys: "F1"–"F12" pass through as-is
+  if (/^F\d+$/.test(code)) { parts.push(code); return parts.join("+"); }
+  // Numpad: "Numpad0" → "Numpad0", etc.
+  if (code.startsWith("Numpad")) { parts.push(code); return parts.join("+"); }
+
+  // Everything else — map to the exact strings the Rust parse_hotkey() handles
+  const codeMap: Record<string, string> = {
+    "Space":        "Space",
+    "Enter":        "Enter",
+    "NumpadEnter":  "NumpadEnter",
+    "Tab":          "Tab",
+    "Escape":       "Escape",
+    "Backspace":    "Backspace",
+    "Delete":       "Delete",
+    "Insert":       "Insert",
+    "Home":         "Home",
+    "End":          "End",
+    "PageUp":       "PageUp",
+    "PageDown":     "PageDown",
+    "ArrowLeft":    "ArrowLeft",
+    "ArrowRight":   "ArrowRight",
+    "ArrowUp":      "ArrowUp",
+    "ArrowDown":    "ArrowDown",
+    "Semicolon":    "Semicolon",
+    "Comma":        "Comma",
+    "Period":       "Period",
+    "Slash":        "Slash",
+    "Backslash":    "Backslash",
+    "Quote":        "Quote",
+    "Backquote":    "Backquote",
+    "Equal":        "Equal",
+    "Minus":        "Minus",
+    "BracketLeft":  "BracketLeft",
+    "BracketRight": "BracketRight",
+    // Media keys
+    "MediaPlayPause":       "MediaPlayPause",
+    "MediaStop":            "MediaStop",
+    "MediaTrackPrevious":   "MediaTrackPrevious",
+    "MediaTrackNext":       "MediaTrackNext",
+    "AudioVolumeMute":      "AudioVolumeMute",
+    "AudioVolumeDown":      "AudioVolumeDown",
+    "AudioVolumeUp":        "AudioVolumeUp",
+  };
+
+  const mapped = codeMap[code];
+  if (mapped) { parts.push(mapped); return parts.join("+"); }
+
+  // Unknown key — skip
+  return null;
 }
 
 export function SettingsView({ settings, onSave }: Props) {

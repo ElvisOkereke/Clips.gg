@@ -56,7 +56,6 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
   const [replayActive, setReplayActive] = useState(false);
   const [replayBusy,   setReplayBusy]   = useState(false);
 
-  const pollRef       = useRef<number>();
   const startedAtRef  = useRef<number>(0);
   const pausedDurRef  = useRef<number>(0);
   const pauseStartRef = useRef<number>(0);
@@ -117,21 +116,23 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
     return () => clearInterval(id);
   }, [isRecording, isPaused]);
 
-  // ── Crash detection poll (5s, 3s warmup) ──────────────────────────────────
+  // ── Status poll — detects crashes and keeps replay state in sync ─────────
   useEffect(() => {
-    if (!isRecording) return;
-    const warmup = window.setTimeout(() => {
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const s = await getRecordingStatus();
-          if (!s.is_recording) {
-            setIsRecording(false); setIsPaused(false); setElapsedSecs(0);
-          }
-        } catch { /* ignore */ }
-      }, 5000);
+    const poll = window.setInterval(async () => {
+      try {
+        const s = await getRecordingStatus();
+        // Detect recording crash
+        if (isRecording && !s.is_recording) {
+          setIsRecording(false); setIsPaused(false); setElapsedSecs(0);
+        }
+        // Keep replay state in sync with the backend (catches external kills too)
+        if (s.replay_active !== replayActive) {
+          setReplayActive(s.replay_active);
+        }
+      } catch { /* ignore */ }
     }, 3000);
-    return () => { clearTimeout(warmup); clearInterval(pollRef.current); };
-  }, [isRecording]);
+    return () => clearInterval(poll);
+  }, [isRecording, replayActive]);
 
   // ── Global hotkey refs ────────────────────────────────────────────────────
   // Handlers are defined later in the file, so initialize refs with no-ops.

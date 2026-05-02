@@ -541,122 +541,97 @@ pub async fn start_replay(
     let enc_cfg        = EncConfig { hw_encoder: Some(hw_encoder), ..enc_cfg };
     let ffmpeg_path    = ffmpeg::find_ffmpeg().map_err(|e| e.to_string())?;
 
-    let cmd_json = serde_json::json!({
-        "cmd": "start_replay",
-        "args": {
-            "ffmpeg_path": ffmpeg_path.to_string_lossy(),
-            "output_path": "",   // recorder generates its own temp path
-            "region": {
-                "x": region.x, "y": region.y,
-                "width": region.width, "height": region.height,
-                "monitor": region.monitor
-            },
-            "audio_cfg": {
-                "mic_device":    audio_cfg.mic_device,
-                "sys_device_id": audio_cfg.sys_device_id,
-                "mic_device_id": audio_cfg.mic_device_id,
-            },
-            "enc_cfg": {
-                "fps": enc_cfg.fps,
-                "quality_crf": enc_cfg.quality_crf.unwrap_or(28),
-                "format": enc_cfg.format.as_deref().unwrap_or("mp4"),
-                "hw_encoder": enc_cfg.hw_encoder.as_deref().unwrap_or("h264_nvenc")
-            }
-        }
-    });
-    let line = serde_json::to_string(&cmd_json).unwrap();
+    // Replay always spawns its OWN isolated process — completely independent from
+    // the main recording child. This means stop_recording never touches replay,
+    // and replay always has its own audio pipe (cliplite_sysaudio_replay).
+    let recorder_exe = find_recorder()
+        .ok_or_else(|| "cliplite-recorder.exe not found".to_string())?;
 
-    // If a recorder child is already running (main recording active), reuse it
     #[cfg(windows)]
     {
-        let rec = recorder.0.lock().unwrap();
-        if let Some(child) = &rec.recorder_child {
-            child.send_line(&line).map_err(|e| e.to_string())?;
-            return Ok("replay_started".into());
-        }
-    }
-
-    // No recorder running — spawn one just for the replay buffer.
-    // This lets the replay buffer work independently without a main recording.
-    if let Some(recorder_exe) = find_recorder() {
-        #[cfg(windows)]
+        // Kill any existing replay child before starting a new one
         {
-            let mut child = spawn_recorder_isolated(&recorder_exe)
-                .map_err(|e| format!("Failed to spawn recorder: {e}"))?;
-
-            child.send_line(&line).map_err(|e| format!("IPC send failed: {e}"))?;
-
-            // Store as the recorder child so stop_replay / save_replay can find it
-            // Mark output_path empty so stop_recording doesn't try to save it as a clip
-            {
-                let mut rec = recorder.0.lock().unwrap();
-                rec.recorder_child = Some(child);
-                rec.output_path    = None;  // replay-only — no main recording path
+            let mut rec = recorder.0.lock().unwrap();
+            if let Some(mut old) = rec.replay_child.take() {
+                old.send_line("{\"cmd\":\"stop_replay\"}").ok();
+                old.send_line("{\"cmd\":\"stop\"}").ok();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                old.close_stdin();
             }
-            return Ok("replay_started".into());
+        }
+
+        let cmd_json = serde_json::json!({
+            "cmd": "start_replay",
+            "args": {
+                "ffmpeg_path": ffmpeg_path.to_string_lossy(),
+                "output_path": "",
+                "region": {
+                    "x": region.x, "y": region.y,
+                    "width": region.width, "height": region.height,
+                    "monitor": region.monitor
+                },
+                "audio_cfg": {
+                    "mic_device":    audio_cfg.mic_device,
+                    "sys_device_id": audio_cfg.sys_device_id,
+                    "mic_device_id": audio_cfg.mic_device_id,
+                },
+                // Replay gets its own separate named pipe so recording audio is unaffected
+                "audio_pipe": r"\\.\pipe\cliplite_sysaudio_replay",
+                "enc_cfg": {
+                    "fps": enc_cfg.fps,
+                    "quality_crf": enc_cfg.quality_crf.unwrap_or(28),
+                    "format": enc_cfg.format.as_deref().unwrap_or("mp4"),
+                    "hw_encoder": enc_cfg.hw_encoder.as_deref().unwrap_or("h264_nvenc")
+                }
+            }
+        });
+        let line = serde_json::to_string(&cmd_json).unwrap();
+
+        let mut child = spawn_recorder_isolated(&recorder_exe)
+            .map_err(|e| format!("Failed to spawn replay recorder: {e}"))?;
+        child.send_line(&line).map_err(|e| format!("IPC send failed: {e}"))?;
+
+        // Read the started/error confirmation from the subprocess
+        loop {
+            let resp = match child.read_line() {
+                Some(r) => r,
+                None => return Err("Replay recorder closed unexpectedly".into()),
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                if v["event"] == "replay_started" {
+                    let mut rec = recorder.0.lock().unwrap();
+                    rec.replay_child = Some(child);
+                    return Ok("replay_started".into());
+                } else if v["event"] == "error" {
+                    return Err(v["message"].as_str().unwrap_or("replay start failed").to_string());
+                }
+            }
         }
     }
 
-    Err("cliplite-recorder.exe not found".into())
+    #[cfg(not(windows))]
+    Err("Replay buffer is only supported on Windows".into())
 }
 
 #[tauri::command]
 pub async fn stop_replay(recorder: State<'_, RecorderState>) -> Result<(), String> {
-    let mut rec = recorder.0.lock().unwrap();
-
     #[cfg(windows)]
     {
-        // Is the recorder child shared with a main recording or replay-only?
-        let is_replay_only = rec.output_path.is_none() && rec.start_time.is_none();
-
-        if is_replay_only {
-            // Replay-only mode: take the child out, stop it completely, discard it.
-            // This prevents the "handle is invalid" error when stop → start again,
-            // because the next StartReplay will spawn a fresh child.
-            if let Some(mut child) = rec.recorder_child.take() {
-                child.send_line("{\"cmd\":\"stop_replay\"}").ok();
-                child.send_line("{\"cmd\":\"stop\"}").ok();
-                // Give the recorder a moment to write its StopReplay event
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                child.close_stdin();
-                // child drops here, all handles closed via Drop
-            } else {
-                return Err("Replay buffer not running".into());
-            }
-        } else {
-            // Shared with a main recording — just send stop_replay, keep the child alive
-            if let Some(child) = &rec.recorder_child {
-                child.send_line("{\"cmd\":\"stop_replay\"}").map_err(|e| e.to_string())?;
-            } else {
-                return Err("Recorder process not running".into());
-            }
+        let mut rec = recorder.0.lock().unwrap();
+        if let Some(mut child) = rec.replay_child.take() {
+            child.send_line("{\"cmd\":\"stop_replay\"}").ok();
+            child.send_line("{\"cmd\":\"stop\"}").ok();
+            // Brief pause so the subprocess can flush StopReplay event and clean temp file
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            child.close_stdin();
+            // child drops here — all Win32 handles closed via Drop
+            return Ok(());
         }
-        return Ok(());
+        return Err("Replay buffer not running".into());
     }
 
     #[cfg(not(windows))]
-    {
-        let is_replay_only = rec.output_path.is_none() && rec.start_time.is_none();
-        if let Some(mut proc) = if is_replay_only { rec.recorder_proc.take() } else { None } {
-            use std::io::Write;
-            if let Some(stdin) = proc.stdin.as_mut() {
-                let _ = stdin.write_all(b"{\"cmd\":\"stop_replay\"}\n");
-                let _ = stdin.write_all(b"{\"cmd\":\"stop\"}\n");
-                let _ = stdin.flush();
-            }
-            drop(proc.stdin.take());
-            proc.wait().ok();
-        } else if let Some(proc) = &rec.recorder_proc {
-            use std::io::Write;
-            if let Some(stdin) = unsafe { &mut *(proc as *const _ as *mut std::process::Child) }.stdin.as_mut() {
-                let _ = stdin.write_all(b"{\"cmd\":\"stop_replay\"}\n");
-                let _ = stdin.flush();
-            }
-        } else {
-            return Err("Recorder process not running".into());
-        }
-        return Ok(());
-    }
+    Err("Replay buffer is only supported on Windows".into())
 }
 
 #[tauri::command]
@@ -679,7 +654,7 @@ pub async fn save_replay(
     let rec  = recorder.0.lock().unwrap();
 
     #[cfg(windows)]
-    if let Some(child) = &rec.recorder_child {
+    if let Some(child) = &rec.replay_child {
         child.send_line(&line).map_err(|e| e.to_string())?;
         // Loop until we receive replay_saved or error — intermediate lines
         // (e.g. buffered status events) are discarded so we never miss the response.

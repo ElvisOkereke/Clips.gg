@@ -144,6 +144,7 @@ pub struct RecordingStatus {
     pub is_paused: bool,
     pub elapsed_seconds: f64,
     pub output_path: Option<String>,
+    pub replay_active: bool,
 }
 
 // ── RecorderInner ────────────────────────────────────────────────────────────
@@ -163,6 +164,10 @@ pub struct RecorderInner {
     // Recorder subprocess via Win32 (preferred — no handle inheritance)
     pub recorder_child: Option<RecorderChild>,
 
+    // Replay buffer subprocess — always a separate isolated process so stopping
+    // recording never kills the replay buffer and vice versa.
+    pub replay_child: Option<RecorderChild>,
+
     // Old std::process::Child path — kept only for status() check of fallback
     pub recorder_proc: Option<std::process::Child>,
 }
@@ -179,6 +184,7 @@ impl Default for RecorderInner {
             #[cfg(windows)]
             sys_audio:       None,
             recorder_child:  None,
+            replay_child:    None,
             recorder_proc:   None,
         }
     }
@@ -191,7 +197,7 @@ impl RecorderInner {
     // ── Status ────────────────────────────────────────────────────────────────
 
     pub fn status(&mut self) -> RecordingStatus {
-        // Check Win32 recorder child first
+        // Check Win32 recorder child (main recording only — replay_child is separate)
         let alive_win32 = if let Some(child) = &self.recorder_child {
             child.try_wait().is_none()
         } else {
@@ -224,11 +230,33 @@ impl RecorderInner {
             self.start_time = None;
         }
 
+        // Prune dead replay child too
+        if let Some(rc) = &self.replay_child {
+            if rc.try_wait().is_some() {
+                self.replay_child = None;
+            }
+        }
+
+        let replay_active = if let Some(rc) = &self.replay_child {
+            rc.try_wait().is_none()
+        } else {
+            false
+        };
+
         RecordingStatus {
             is_recording:    alive,
             is_paused:       self.is_paused,
             elapsed_seconds: if alive { self.elapsed_seconds() } else { 0.0 },
             output_path:     self.output_path.clone(),
+            replay_active,
+        }
+    }
+
+    pub fn replay_is_active(&self) -> bool {
+        if let Some(rc) = &self.replay_child {
+            rc.try_wait().is_none()
+        } else {
+            false
         }
     }
 
