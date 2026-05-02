@@ -349,41 +349,80 @@ fn main() {
                 let start_secs = (total_duration_secs - want_secs).max(0.0);
 
                 #[cfg(windows)]
+                let mut ffmpeg_error = String::new();
+                #[cfg(windows)]
                 let status = {
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    std::process::Command::new(&ffmpeg)
+                    let mut child = match std::process::Command::new(&ffmpeg)
                         .args([
                             "-y",
                             "-ss", &format!("{start_secs:.3}"),
                             "-i", &src,
-                            "-c", "copy",
+                            "-c:v", "copy",  // Copy video codec without re-encoding
+                            "-an",  // Disable audio (replay buffer might not have valid audio)
                             "-avoid_negative_ts", "make_zero",
                             "-movflags", "+faststart",
                             &output_path,
                         ])
                         .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
                         .creation_flags(CREATE_NO_WINDOW)
-                        .status()
+                        .spawn() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            emit(&Event::Error { message: format!("Failed to spawn FFmpeg: {e}") });
+                            continue;
+                        }
+                    };
+                    
+                    if let Some(mut stderr) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = stderr.read_to_string(&mut ffmpeg_error);
+                    }
+                    
+                    child.wait().unwrap_or_else(|e| {
+                        emit(&Event::Error { message: format!("FFmpeg wait error: {e}") });
+                        std::process::ExitStatus::default()
+                    })
                 };
+                
                 #[cfg(not(windows))]
-                let status = std::process::Command::new(&ffmpeg)
-                    .args(["-y", "-ss", &format!("{start_secs:.3}"), "-i", &src,
-                           "-c", "copy", "-avoid_negative_ts", "make_zero",
-                           "-movflags", "+faststart", &output_path])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                let ffmpeg_error = String::new();
+                #[cfg(not(windows))]
+                {
+                    let status = std::process::Command::new(&ffmpeg)
+                        .args(["-y", "-ss", &format!("{start_secs:.3}"), "-i", &src,
+                               "-c:v", "copy", "-an", "-avoid_negative_ts", "make_zero",
+                               "-movflags", "+faststart", &output_path])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
 
-                match status {
-                    Ok(s) if s.success() => emit(&Event::ReplaySaved { path: output_path }),
-                    Ok(s) => emit(&Event::Error {
-                        message: format!("FFmpeg exited {:?}", s.code()),
-                    }),
-                    Err(e) => emit(&Event::Error {
-                        message: format!("FFmpeg not found at '{ffmpeg}': {e}"),
-                    }),
+                    match status {
+                        Ok(s) if s.success() => emit(&Event::ReplaySaved { path: output_path }),
+                        Ok(s) => {
+                            let err_msg = format!("FFmpeg exited with code: {:?}", s.code());
+                            emit(&Event::Error { message: err_msg });
+                        },
+                        Err(e) => emit(&Event::Error {
+                            message: format!("FFmpeg not found at '{ffmpeg}': {e}"),
+                        }),
+                    }
+                }
+
+                #[cfg(windows)]
+                {
+                    if status.success() {
+                        emit(&Event::ReplaySaved { path: output_path })
+                    } else {
+                        let err_msg = if !ffmpeg_error.is_empty() {
+                            format!("FFmpeg error:\n{}", ffmpeg_error)
+                        } else {
+                            format!("FFmpeg exited with code: {:?}", status.code())
+                        };
+                        emit(&Event::Error { message: err_msg });
+                    }
                 }
             }
         }
