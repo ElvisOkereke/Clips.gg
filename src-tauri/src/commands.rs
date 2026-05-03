@@ -286,7 +286,7 @@ pub async fn start_recording(
     if let Some(recorder_exe) = find_recorder() {
         #[cfg(windows)]
         {
-            let mut child = spawn_recorder_isolated(&recorder_exe)
+            let child = spawn_recorder_isolated(&recorder_exe)
                 .map_err(|e| format!("Failed to spawn recorder: {e}"))?;
 
             // Send start command
@@ -511,19 +511,6 @@ pub fn get_recording_status(recorder: State<'_, RecorderState>) -> RecordingStat
 // The recorder binary keeps a rolling temp file; SaveReplay extracts the last
 // N seconds using FFmpeg's -sseof (seek from end of file).
 
-/// Send a raw JSON command line to the recorder child (Win32 or std path).
-fn send_to_recorder(rec: &crate::recorder::RecorderInner, line: &str) -> bool {
-    use std::io::Write;
-    #[cfg(windows)]
-    if let Some(child) = &rec.recorder_child {
-        return child.send_line(line).is_ok();
-    }
-    if let Some(proc) = &rec.recorder_proc {
-        // For std::process::Child we can't easily write without &mut
-        // Fall through to false — replay only works with Win32 path
-    }
-    false
-}
 
 #[tauri::command]
 pub async fn start_replay(
@@ -587,7 +574,7 @@ pub async fn start_replay(
         });
         let line = serde_json::to_string(&cmd_json).unwrap();
 
-        let mut child = spawn_recorder_isolated(&recorder_exe)
+        let child = spawn_recorder_isolated(&recorder_exe)
             .map_err(|e| format!("Failed to spawn replay recorder: {e}"))?;
         child.send_line(&line).map_err(|e| format!("IPC send failed: {e}"))?;
 

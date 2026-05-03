@@ -149,7 +149,30 @@ export default function App() {
         {view === "settings" && <SettingsView settings={settings} onSave={handleSaveSettings} />}
       </div>
 
-      <div className="status-bar">{status || "Ready"}</div>
+      <div className="status-bar" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {status || "Ready"}
+        </span>
+        {status && /error|failed|cannot|invalid/i.test(status) && (
+          <button
+            title="Copy error to clipboard"
+            onClick={() => navigator.clipboard.writeText(status).catch(() => {})}
+            style={{
+              flexShrink: 0,
+              background: "rgba(255,255,255,0.08)",
+              border: "1px solid rgba(255,255,255,0.15)",
+              borderRadius: 4,
+              color: "var(--text-muted)",
+              cursor: "pointer",
+              fontSize: 11,
+              padding: "1px 6px",
+              lineHeight: "16px",
+            }}
+          >
+            Copy
+          </button>
+        )}
+      </div>
 
       {/* Replay saved toast — appears for 3 seconds over everything */}
       {replayToast && (

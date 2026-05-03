@@ -29,7 +29,7 @@ enum Command {
     SaveReplay  { secs: u32, output_path: String },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StartArgs {
     pub ffmpeg_path:  String,
     pub output_path:  String,
@@ -201,11 +201,13 @@ fn main() {
     let replay_state = Arc::new(Mutex::new(recorder::RecorderInner::default()));
     let replay_path  = Arc::new(Mutex::new(String::new()));
 
-    // Store the ffmpeg path and replay start time.
+    // Store the ffmpeg path, replay start time, and original StartArgs.
     // We track duration ourselves (not via ffprobe) because the MKV is
     // exclusively locked by the writer FFmpeg — no other process can read it.
+    // StartArgs is stored so we can restart the writer after a save.
     let replay_ffmpeg_path  = Arc::new(Mutex::new(String::new()));
     let replay_start_time: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+    let replay_start_args: Arc<Mutex<Option<StartArgs>>> = Arc::new(Mutex::new(None));
 
     let stdin  = std::io::stdin();
     let reader = BufReader::new(stdin.lock());
@@ -257,8 +259,9 @@ fn main() {
 
             // ── Replay buffer ─────────────────────────────────────────────────
             Command::StartReplay { args } => {
-                // Store ffmpeg path for use in SaveReplay
+                // Store ffmpeg path and full args for use in SaveReplay (restart after save)
                 *replay_ffmpeg_path.lock().unwrap() = args.ffmpeg_path.clone();
+                *replay_start_args.lock().unwrap()  = Some(args.clone());
 
                 // Use MKV (not MP4) as temp format — readable while FFmpeg writes.
                 // Use USERPROFILE to avoid 8.3 short paths on Windows.
@@ -320,9 +323,10 @@ fn main() {
                         if !path.is_empty() {
                             std::fs::remove_file(&path).ok();
                         }
-                        *replay_path.lock().unwrap() = String::new();
+                        *replay_path.lock().unwrap()       = String::new();
                         *replay_ffmpeg_path.lock().unwrap() = String::new();
                         *replay_start_time.lock().unwrap() = None;
+                        *replay_start_args.lock().unwrap() = None;
                         emit(&Event::ReplayStopped);
                     }
                     Err(e) => emit(&Event::Error { message: e.to_string() }),
@@ -335,12 +339,8 @@ fn main() {
                     emit(&Event::Error { message: "Replay buffer not active — start it first".into() });
                     continue;
                 }
-                if !std::path::Path::new(&src).exists() {
-                    emit(&Event::Error { message: format!("Replay temp file not found: {src}") });
-                    continue;
-                }
 
-                // Resolve the bundled FFmpeg binary
+                // Resolve FFmpeg binary
                 let ffmpeg = {
                     let stored = replay_ffmpeg_path.lock().unwrap().clone();
                     if !stored.is_empty() && std::path::Path::new(&stored).exists() {
@@ -356,15 +356,7 @@ fn main() {
                     }
                 };
 
-                // Create output directory
-                if let Some(parent) = std::path::Path::new(&output_path).parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-
-                // ── Calculate how much footage is in the buffer ──────────────
-                // We track the start time ourselves because the MKV file is
-                // exclusively locked by the writer FFmpeg — no other process
-                // can open it to probe the duration while it's being written.
+                // ── How long has the buffer been running? ────────────────────
                 let total_duration_secs = replay_start_time.lock().unwrap()
                     .map(|t| t.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
@@ -374,23 +366,44 @@ fn main() {
                     continue;
                 }
 
-                // Calculate start offset: seek from beginning to (total - requested) seconds
-                let want_secs = secs as f64;
+                let want_secs  = secs as f64;
                 let start_secs = (total_duration_secs - want_secs).max(0.0);
 
+                // ── STEP 1: Stop the writer so MKV is fully sealed ───────────
+                // An MKV being written by FFmpeg cannot be read by another
+                // process — EBML header / cluster boundaries are incomplete.
+                // We must gracefully stop the writer (sends 'q', waits for
+                // moov/EBML finalization), then read the sealed file.
+                {
+                    let mut rr = replay_state.lock().unwrap();
+                    rr.stop().ok(); // stops writer FFmpeg, waits for exit
+                }
+                *replay_start_time.lock().unwrap() = None;
+
+                // Verify the sealed file is usable
+                if !std::path::Path::new(&src).exists() {
+                    emit(&Event::Error { message: format!("Replay temp file missing after stop: {src}") });
+                    continue;
+                }
+
+                // Create output directory
+                if let Some(parent) = std::path::Path::new(&output_path).parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+
+                // ── STEP 2: Extract the clip from the sealed MKV ─────────────
+                let mut ffmpeg_stderr = String::new();
+
                 #[cfg(windows)]
-                let mut ffmpeg_error = String::new();
-                #[cfg(windows)]
-                let status = {
+                let extract_ok = {
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    let mut child = match std::process::Command::new(&ffmpeg)
+                    match std::process::Command::new(&ffmpeg)
                         .args([
                             "-y",
                             "-ss", &format!("{start_secs:.3}"),
                             "-i", &src,
-                            "-c:v", "copy",  // Copy video codec without re-encoding
-                            "-an",  // Disable audio (replay buffer might not have valid audio)
+                            "-c", "copy",
                             "-avoid_negative_ts", "make_zero",
                             "-movflags", "+faststart",
                             &output_path,
@@ -398,61 +411,75 @@ fn main() {
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::piped())
                         .creation_flags(CREATE_NO_WINDOW)
-                        .spawn() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            emit(&Event::Error { message: format!("Failed to spawn FFmpeg: {e}") });
-                            continue;
+                        .spawn()
+                    {
+                        Err(e) => { ffmpeg_stderr = format!("Failed to spawn FFmpeg: {e}"); false }
+                        Ok(mut child) => {
+                            if let Some(mut se) = child.stderr.take() {
+                                use std::io::Read;
+                                se.read_to_string(&mut ffmpeg_stderr).ok();
+                            }
+                            child.wait().map(|s| s.success()).unwrap_or(false)
                         }
-                    };
-                    
-                    if let Some(mut stderr) = child.stderr.take() {
-                        use std::io::Read;
-                        let _ = stderr.read_to_string(&mut ffmpeg_error);
                     }
-                    
-                    child.wait().unwrap_or_else(|e| {
-                        emit(&Event::Error { message: format!("FFmpeg wait error: {e}") });
-                        std::process::ExitStatus::default()
-                    })
                 };
-                
                 #[cfg(not(windows))]
-                let ffmpeg_error = String::new();
-                #[cfg(not(windows))]
-                {
-                    let status = std::process::Command::new(&ffmpeg)
+                let extract_ok = {
+                    match std::process::Command::new(&ffmpeg)
                         .args(["-y", "-ss", &format!("{start_secs:.3}"), "-i", &src,
-                               "-c:v", "copy", "-an", "-avoid_negative_ts", "make_zero",
+                               "-c", "copy", "-avoid_negative_ts", "make_zero",
                                "-movflags", "+faststart", &output_path])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
-                        .status();
+                        .status()
+                    {
+                        Ok(s) => s.success(),
+                        Err(e) => { ffmpeg_stderr = e.to_string(); false }
+                    }
+                };
 
-                    match status {
-                        Ok(s) if s.success() => emit(&Event::ReplaySaved { path: output_path }),
-                        Ok(s) => {
-                            let err_msg = format!("FFmpeg exited with code: {:?}", s.code());
-                            emit(&Event::Error { message: err_msg });
-                        },
-                        Err(e) => emit(&Event::Error {
-                            message: format!("FFmpeg not found at '{ffmpeg}': {e}"),
-                        }),
+                // Delete the old sealed temp file regardless of success
+                std::fs::remove_file(&src).ok();
+                *replay_path.lock().unwrap() = String::new();
+
+                // ── STEP 3: Restart the replay writer into a new temp file ───
+                // Do this before emitting the result so the buffer is already
+                // rolling again by the time the UI updates.
+                let saved_args = replay_start_args.lock().unwrap().clone();
+                if let Some(restart_args) = saved_args {
+                    let tmp_dir = std::env::var("USERPROFILE")
+                        .map(|p| std::path::PathBuf::from(p)
+                            .join("AppData").join("Local").join("Temp"))
+                        .unwrap_or_else(|_| std::env::temp_dir());
+                    std::fs::create_dir_all(&tmp_dir).ok();
+                    let new_tmp = tmp_dir.join(format!("cliplite_replay_{}.mkv", std::process::id()));
+                    let new_tmp_str = new_tmp.to_string_lossy().to_string();
+
+                    let fps = restart_args.enc_cfg.fps;
+                    let new_args = StartArgs { output_path: new_tmp_str.clone(), ..restart_args };
+                    let mut rr = replay_state.lock().unwrap();
+                    match do_start_with_extra(&mut rr, new_args, &["-g", &fps.to_string()]) {
+                        Ok(_) => {
+                            *replay_path.lock().unwrap() = new_tmp_str;
+                            *replay_start_time.lock().unwrap() = Some(std::time::Instant::now());
+                        }
+                        Err(e) => {
+                            eprintln!("[recorder] replay restart failed: {e}");
+                            // Buffer is stopped — the UI will detect this via status poll
+                        }
                     }
                 }
 
-                #[cfg(windows)]
-                {
-                    if status.success() {
-                        emit(&Event::ReplaySaved { path: output_path })
+                // ── STEP 4: Emit result ───────────────────────────────────────
+                if extract_ok {
+                    emit(&Event::ReplaySaved { path: output_path });
+                } else {
+                    let msg = if ffmpeg_stderr.is_empty() {
+                        "FFmpeg exited with non-zero status".to_string()
                     } else {
-                        let err_msg = if !ffmpeg_error.is_empty() {
-                            format!("FFmpeg error:\n{}", ffmpeg_error)
-                        } else {
-                            format!("FFmpeg exited with code: {:?}", status.code())
-                        };
-                        emit(&Event::Error { message: err_msg });
-                    }
+                        format!("FFmpeg error: {ffmpeg_stderr}")
+                    };
+                    emit(&Event::Error { message: msg });
                 }
             }
         }
