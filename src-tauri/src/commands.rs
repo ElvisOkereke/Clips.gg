@@ -569,7 +569,8 @@ pub async fn start_replay(
                     "quality_crf": enc_cfg.quality_crf.unwrap_or(28),
                     "format": enc_cfg.format.as_deref().unwrap_or("mp4"),
                     "hw_encoder": enc_cfg.hw_encoder.as_deref().unwrap_or("h264_nvenc")
-                }
+                },
+                "max_replay_buffer_size_mb": settings.max_replay_buffer_size_mb
             }
         });
         let line = serde_json::to_string(&cmd_json).unwrap();

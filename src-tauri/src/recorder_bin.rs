@@ -40,6 +40,10 @@ pub struct StartArgs {
     /// If absent, defaults to cliplite_sysaudio.
     #[serde(default)]
     pub audio_pipe:   Option<String>,
+    /// Max size in MB for temporary replay buffer files (0 = unlimited).
+    /// When exceeded, oldest temp files are automatically cleaned up.
+    #[serde(default)]
+    pub max_replay_buffer_size_mb: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +79,70 @@ fn emit(event: &Event) {
     let json = serde_json::to_string(event).unwrap_or_default();
     println!("{json}");
     std::io::stdout().flush().ok();
+}
+
+/// Get the ClipLite app directory (~/.cliplite).
+/// All app files (settings, library, temp files, etc.) are stored here.
+fn get_app_dir() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".cliplite")
+}
+
+/// Get the replay temp directory (~/.cliplite/temp).
+/// Ensures the directory exists.
+fn get_replay_temp_dir() -> std::path::PathBuf {
+    let tmp_dir = get_app_dir().join("temp");
+    std::fs::create_dir_all(&tmp_dir).ok();
+    tmp_dir
+}
+
+/// Clean up old replay temp files if total size exceeds the limit.
+/// Deletes oldest files first until total size is under the limit.
+fn cleanup_old_replay_files(max_size_mb: u32) {
+    if max_size_mb == 0 {
+        return; // unlimited — no cleanup needed
+    }
+
+    let tmp_dir = get_replay_temp_dir();
+
+    // Find all cliplite_replay_*.mkv files
+    let mut files = match std::fs::read_dir(&tmp_dir) {
+        Ok(entries) => {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.is_file() && path.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.starts_with("cliplite_replay_") && s.ends_with(".mkv"))
+                        .unwrap_or(false)
+                    {
+                        entry.metadata().ok().map(|m| (path, m.modified().ok(), m.len()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        Err(_) => return,
+    };
+
+    // Sort by modification time (oldest first)
+    files.sort_by_key(|(_, mtime, _)| *mtime);
+
+    // Calculate total size and delete oldest files until under limit
+    let max_bytes = (max_size_mb as u64) * 1024 * 1024;
+    let mut total_size: u64 = files.iter().map(|(_, _, size)| size).sum();
+
+    for (path, _, size) in files {
+        if total_size <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total_size = total_size.saturating_sub(size);
+        }
+    }
 }
 
 /// Start a recording with optional extra FFmpeg args inserted before the output path.
@@ -259,17 +327,16 @@ fn main() {
 
             // ── Replay buffer ─────────────────────────────────────────────────
             Command::StartReplay { args } => {
+                // Clean up old temp files if buffer size limit exceeded
+                cleanup_old_replay_files(args.max_replay_buffer_size_mb);
+
                 // Store ffmpeg path and full args for use in SaveReplay (restart after save)
                 *replay_ffmpeg_path.lock().unwrap() = args.ffmpeg_path.clone();
                 *replay_start_args.lock().unwrap()  = Some(args.clone());
 
                 // Use MKV (not MP4) as temp format — readable while FFmpeg writes.
-                // Use USERPROFILE to avoid 8.3 short paths on Windows.
-                let tmp_dir = std::env::var("USERPROFILE")
-                    .map(|p| std::path::PathBuf::from(p)
-                        .join("AppData").join("Local").join("Temp"))
-                    .unwrap_or_else(|_| std::env::temp_dir());
-                std::fs::create_dir_all(&tmp_dir).ok();
+                // Store in ~/.cliplite/temp for easy storage analysis.
+                let tmp_dir = get_replay_temp_dir();
                 let tmp = tmp_dir.join(format!("cliplite_replay_{}.mkv", std::process::id()));
                 let tmp_str = tmp.to_string_lossy().to_string();
                 *replay_path.lock().unwrap() = tmp_str.clone();
@@ -398,27 +465,34 @@ fn main() {
                 let extract_ok = {
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    match std::process::Command::new(&ffmpeg)
-                        .args([
-                            "-y",
-                            "-ss", &format!("{start_secs:.3}"),
-                            "-i", &src,
-                            "-c", "copy",
-                            "-avoid_negative_ts", "make_zero",
-                            "-movflags", "+faststart",
-                            &output_path,
-                        ])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .spawn()
-                    {
+                    let mut cmd = std::process::Command::new(&ffmpeg);
+                    cmd.args([
+                        "-y",
+                        "-ss", &format!("{start_secs:.3}"),
+                        "-i", &src,
+                        "-c:v", "copy",
+                        "-c:a", "copy",
+                        "-avoid_negative_ts", "make_zero",
+                        "-movflags", "+faststart",
+                        &output_path,
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .creation_flags(CREATE_NO_WINDOW);
+                    
+                    match cmd.spawn() {
                         Err(e) => { ffmpeg_stderr = format!("Failed to spawn FFmpeg: {e}"); false }
                         Ok(mut child) => {
-                            if let Some(mut se) = child.stderr.take() {
+                            // Read stderr before waiting to avoid deadlock
+                            let stderr_content = if let Some(mut se) = child.stderr.take() {
                                 use std::io::Read;
-                                se.read_to_string(&mut ffmpeg_stderr).ok();
-                            }
+                                let mut buf = String::new();
+                                se.read_to_string(&mut buf).ok();
+                                buf
+                            } else {
+                                String::new()
+                            };
+                            ffmpeg_stderr = stderr_content;
                             child.wait().map(|s| s.success()).unwrap_or(false)
                         }
                     }
@@ -427,7 +501,8 @@ fn main() {
                 let extract_ok = {
                     match std::process::Command::new(&ffmpeg)
                         .args(["-y", "-ss", &format!("{start_secs:.3}"), "-i", &src,
-                               "-c", "copy", "-avoid_negative_ts", "make_zero",
+                               "-c:v", "copy", "-c:a", "copy",
+                               "-avoid_negative_ts", "make_zero",
                                "-movflags", "+faststart", &output_path])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -442,33 +517,17 @@ fn main() {
                 std::fs::remove_file(&src).ok();
                 *replay_path.lock().unwrap() = String::new();
 
-                // ── STEP 3: Restart the replay writer into a new temp file ───
-                // Do this before emitting the result so the buffer is already
-                // rolling again by the time the UI updates.
+                // ── STEP 3: Clean up old temp files (don't restart here) ───
+                // Restarting the buffer can block and cause app freeze. Let the UI
+                // call start_replay again if the user wants to continue recording.
                 let saved_args = replay_start_args.lock().unwrap().clone();
                 if let Some(restart_args) = saved_args {
-                    let tmp_dir = std::env::var("USERPROFILE")
-                        .map(|p| std::path::PathBuf::from(p)
-                            .join("AppData").join("Local").join("Temp"))
-                        .unwrap_or_else(|_| std::env::temp_dir());
-                    std::fs::create_dir_all(&tmp_dir).ok();
-                    let new_tmp = tmp_dir.join(format!("cliplite_replay_{}.mkv", std::process::id()));
-                    let new_tmp_str = new_tmp.to_string_lossy().to_string();
-
-                    let fps = restart_args.enc_cfg.fps;
-                    let new_args = StartArgs { output_path: new_tmp_str.clone(), ..restart_args };
-                    let mut rr = replay_state.lock().unwrap();
-                    match do_start_with_extra(&mut rr, new_args, &["-g", &fps.to_string()]) {
-                        Ok(_) => {
-                            *replay_path.lock().unwrap() = new_tmp_str;
-                            *replay_start_time.lock().unwrap() = Some(std::time::Instant::now());
-                        }
-                        Err(e) => {
-                            eprintln!("[recorder] replay restart failed: {e}");
-                            // Buffer is stopped — the UI will detect this via status poll
-                        }
-                    }
+                    cleanup_old_replay_files(restart_args.max_replay_buffer_size_mb);
                 }
+
+                // Clear the replay args so the buffer is stopped
+                *replay_start_args.lock().unwrap() = None;
+                *replay_ffmpeg_path.lock().unwrap() = String::new();
 
                 // ── STEP 4: Emit result ───────────────────────────────────────
                 if extract_ok {

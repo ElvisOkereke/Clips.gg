@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { RecorderView } from "./components/RecorderView";
 import { LibraryView } from "./components/LibraryView";
 import { SettingsView } from "./components/SettingsView";
-import { DebugPanel } from "./components/DebugPanel";
+
 import { getSettings, saveSettings, applyHotkeys, detectHwEncoder } from "./api";
 import type { Settings, View } from "./types";
 
@@ -32,6 +32,8 @@ const DEFAULT_SETTINGS: Settings = {
   replay_buffer_duration_secs: 0,
   replay_output_dir: "",
   replay_filename_template: "replay_{datetime}",
+  selected_monitor: 0,
+  max_replay_buffer_size_mb: 500,
 };
 
 /** Floating toast shown briefly when a replay clip is saved. */
@@ -182,8 +184,7 @@ export default function App() {
         />
       )}
 
-      {/* Debug Panel — always available in bottom-right */}
-      <DebugPanel />
+
     </div>
   );
 }

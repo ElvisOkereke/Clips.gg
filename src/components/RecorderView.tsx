@@ -33,7 +33,7 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
   const [monitors,   setMonitors]   = useState<MonitorInfo[]>([]);
 
   // ── Config — initialised from persisted settings ──────────────────────────
-  const [selectedMonitor, setSelectedMonitor] = useState(0);
+  const [selectedMonitor, setSelectedMonitor] = useState(settings.selected_monitor ?? 0);
   const [fps,         setFps]        = useState(settings.default_fps);
   const [format,      setFormat]     = useState(settings.default_format);
   const [qualityIdx,  setQualityIdx] = useState(() => {
@@ -47,6 +47,39 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
     const idx = REPLAY_OPTIONS.findIndex(o => o.secs === settings.replay_buffer_duration_secs);
     return idx >= 0 ? idx : 0;
   });
+
+  // ── Sync local config state when settings prop updates (e.g. after async load) ──
+  // Only update fields that aren't actively being changed by the user (not recording).
+  // We track whether settings have been loaded from the backend to avoid overwriting
+  // user changes with stale defaults.
+  const settingsLoadedRef = useRef(false);
+  useEffect(() => {
+    // Skip the very first render — useState already consumed the initial settings.
+    // Only sync once the real settings arrive from the backend (non-empty output_dir
+    // is a reliable indicator that getSettings() has resolved).
+    if (!settingsLoadedRef.current && settings.output_dir) {
+      settingsLoadedRef.current = true;
+      setSelectedMonitor(settings.selected_monitor ?? 0);
+      setFps(settings.default_fps);
+      setFormat(settings.default_format);
+      setQualityIdx(() => {
+        const idx = QP.findIndex(p => p.crf === settings.default_quality_crf);
+        return idx >= 0 ? idx : 2;
+      });
+      const newMicId = settings.mic_device_id ?? null;
+      setMicDeviceId(newMicId);
+      // Also restore the display name so buildAudioCfg sends the correct legacy name
+      if (newMicId) {
+        setMicDevice(micDevices.find(d => d.id === newMicId)?.name ?? null);
+      }
+      setSysDeviceId(settings.sys_audio_device_id ?? null);
+      setReplayIdx(() => {
+        const idx = REPLAY_OPTIONS.findIndex(o => o.secs === settings.replay_buffer_duration_secs);
+        return idx >= 0 ? idx : 0;
+      });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings]);
 
   // ── Recording state ───────────────────────────────────────────────────────
   const [isRecording,  setIsRecording]  = useState(false);
@@ -298,7 +331,7 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
         <div className="card-title">Capture</div>
         <div className="form-row">
           <span className="form-label">Monitor</span>
-          <select value={selectedMonitor} onChange={e => setSelectedMonitor(+e.target.value)} disabled={isRecording}>
+          <select value={selectedMonitor} onChange={e => { const v=+e.target.value; setSelectedMonitor(v); persist({ selected_monitor: v }); }} disabled={isRecording}>
             {monitors.length > 0
               ? monitors.map((m, i) => <option key={i} value={i}>{m.name || `Display ${i+1}`} ({m.width}×{m.height})</option>)
               : <option value={0}>Display 1 (1920×1080)</option>}

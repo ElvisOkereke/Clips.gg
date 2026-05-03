@@ -77,6 +77,8 @@ export interface Settings {
   replay_buffer_duration_secs: number;  // 0 = disabled
   replay_output_dir: string;            // empty = same as output_dir
   replay_filename_template: string;     // e.g. "replay_{datetime}"
+  selected_monitor: number;             // last-used monitor index (0 = primary)
+  max_replay_buffer_size_mb: number;    // max temp buffer size in MB (0 = unlimited)
 }
 
 export type View = "recorder" | "library" | "settings";

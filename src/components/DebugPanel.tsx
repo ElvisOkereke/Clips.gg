@@ -25,13 +25,23 @@ const ACTION_TO_EVENT: Record<string, string> = {
   "replay_save":      "hotkey-replay-save",
 };
 
-export function DebugPanel() {
+interface Props {
+  enabled: boolean;
+}
+
+export function DebugPanel({ enabled }: Props) {
   const [debugState, setDebugState] = useState<DebugState | null>(null);
   const [hotkeyEvents, setHotkeyEvents] = useState<HotkeyEvent[]>([]);
+  // Start collapsed to avoid hiding content
   const [isExpanded, setIsExpanded] = useState(false);
   const eventListRef = useRef<HTMLDivElement>(null);
 
-  // Poll backend debug state every 1 second
+  // Don't render at all if disabled
+  if (!enabled) {
+    return null;
+  }
+
+  // Poll backend debug state every 1 second (runs even when collapsed)
   useEffect(() => {
     const pollState = async () => {
       try {
@@ -47,7 +57,7 @@ export function DebugPanel() {
     return () => clearInterval(interval);
   }, []);
 
-  // Listen for all hotkey events so the debug panel shows them arriving
+  // Listen for all hotkey events so the debug panel shows them arriving (runs even when collapsed)
   useEffect(() => {
     const eventNames = Object.values(ACTION_TO_EVENT);
     const unlisteners = eventNames.map(name =>
@@ -78,6 +88,7 @@ export function DebugPanel() {
     }
   };
 
+  // If not expanded, show just the button
   if (!isExpanded) {
     return (
       <button
@@ -97,6 +108,7 @@ export function DebugPanel() {
           zIndex: 1000,
           boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
         }}
+        title="Click to open debug panel"
       >
         🐛 Debug
       </button>

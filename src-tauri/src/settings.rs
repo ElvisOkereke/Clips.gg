@@ -27,6 +27,8 @@ pub struct Settings {
     pub replay_buffer_duration_secs: u32,   // 0 = disabled
     pub replay_output_dir: String,          // empty = same as output_dir
     pub replay_filename_template: String,   // e.g. "replay_{datetime}"
+    pub selected_monitor: u32,              // last-used monitor index (0 = primary)
+    pub max_replay_buffer_size_mb: u32,     // max temp buffer size before oldest files are cleaned (0 = unlimited)
 }
 
 impl Default for Settings {
@@ -63,6 +65,8 @@ impl Default for Settings {
             replay_buffer_duration_secs: 0,
             replay_output_dir: String::new(),   // empty = same as output_dir
             replay_filename_template: "replay_{datetime}".to_string(),
+            selected_monitor: 0,
+            max_replay_buffer_size_mb: 500, // 500 MB default
         }
     }
 }

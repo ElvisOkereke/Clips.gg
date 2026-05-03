@@ -215,14 +215,32 @@ export function SettingsView({ settings, onSave }: Props) {
             <code>{"{time}"}</code> → 143022
           </p>
 
-          <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
-            Current save path: <strong>
-              {(s.replay_output_dir || s.output_dir || "~/Videos/ClipLite")}
-              /{(s.replay_filename_template || "replay_{datetime}")}.mp4
-            </strong>
-          </p>
-        </div>
-      </div>
+           <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
+             Current save path: <strong>
+               {(s.replay_output_dir || s.output_dir || "~/Videos/ClipLite")}
+               /{(s.replay_filename_template || "replay_{datetime}")}.mp4
+             </strong>
+           </p>
+
+           <div className="form-row" style={{ marginTop: 12 }}>
+             <span className="form-label" title="Maximum size for temporary buffer files. Oldest files are automatically cleaned up when exceeded. Set to 0 for unlimited.">
+               Max buffer size
+             </span>
+             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+               <input
+                 type="number"
+                 min="0"
+                 max="10000"
+                 step="50"
+                 value={s.max_replay_buffer_size_mb}
+                 onChange={e => update("max_replay_buffer_size_mb", Math.max(0, +e.target.value))}
+                 style={{ width: 80 }}
+               />
+               <span style={{ fontSize: 12, color: "var(--text-muted)" }}>MB (0 = unlimited)</span>
+             </div>
+           </div>
+         </div>
+       </div>
 
       {/* Hotkeys */}
       <div className="settings-section">
