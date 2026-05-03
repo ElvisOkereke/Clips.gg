@@ -27,44 +27,66 @@ pub struct SysAudioCapture {
 
 #[cfg(windows)]
 impl SysAudioCapture {
-    pub fn start(sys_device_id: Option<String>, mic_device_id: Option<String>) -> Result<Self> {
+    pub fn start(sys_device_id: Option<String>, mic_device_id: Option<String>) -> Result<Option<Self>> {
         Self::start_with_pipe(sys_device_id, mic_device_id, r"\\.\pipe\cliplite_sysaudio".into())
     }
 
-    pub fn start_replay(sys_device_id: Option<String>, mic_device_id: Option<String>) -> Result<Self> {
+    pub fn start_replay(sys_device_id: Option<String>, mic_device_id: Option<String>) -> Result<Option<Self>> {
         Self::start_with_pipe(sys_device_id, mic_device_id, r"\\.\pipe\cliplite_sysaudio_replay".into())
     }
 
-    pub fn start_with_pipe(sys_device_id: Option<String>, mic_device_id: Option<String>, pipe_name: String) -> Result<Self> {
+    /// Returns Ok(Some(capture)) if audio started successfully, Ok(None) if the audio
+    /// devices failed to open (caller should then build an audio-free FFmpeg command).
+    pub fn start_with_pipe(sys_device_id: Option<String>, mic_device_id: Option<String>, pipe_name: String) -> Result<Option<Self>> {
         use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
         let stop   = Arc::new(AtomicBool::new(false));
         let stop2  = Arc::clone(&stop);
-        let ready: Arc<Mutex<Option<AudioFormat>>> = Arc::new(Mutex::new(None));
+
+        // None = not ready yet, Some(Ok(fmt)) = pipe ready, Some(Err(msg)) = failed
+        let ready: Arc<Mutex<Option<Result<AudioFormat, String>>>> = Arc::new(Mutex::new(None));
         let ready2 = Arc::clone(&ready);
 
         let thread = std::thread::Builder::new()
             .name("sys-audio".into())
             .spawn(move || {
-                if let Err(e) = capture_loop(sys_device_id.as_deref(), mic_device_id.as_deref(), &pipe_name, &stop2, &ready2) {
-                    eprintln!("[recorder audio] {e}");
-                    *ready2.lock().unwrap() = Some(AudioFormat {
-                        sample_rate: PIPE_SAMPLE_RATE,
-                        channels:    PIPE_CHANNELS,
-                    });
+                match capture_loop(sys_device_id.as_deref(), mic_device_id.as_deref(), &pipe_name, &stop2, &ready2) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("[recorder audio] {e}");
+                        // Signal failure so the caller can disable audio in FFmpeg
+                        let mut g = ready2.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(Err(e.to_string()));
+                        }
+                    }
                 }
             })?;
 
         let t0 = std::time::Instant::now();
-        let format = loop {
-            { let g = ready.lock().unwrap(); if let Some(ref f) = *g { break f.clone(); } }
-            if t0.elapsed().as_secs() >= 3 {
-                break AudioFormat { sample_rate: PIPE_SAMPLE_RATE, channels: PIPE_CHANNELS };
+        let result = loop {
+            {
+                let g = ready.lock().unwrap();
+                if let Some(ref r) = *g { break r.clone(); }
+            }
+            if t0.elapsed().as_secs() >= 5 {
+                break Err("Audio pipe timed out".to_string());
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
 
-        Ok(SysAudioCapture { stop, thread: Some(thread), format })
+        match result {
+            Ok(format) => Ok(Some(SysAudioCapture { stop, thread: Some(thread), format })),
+            Err(e) => {
+                // Audio failed — stop the thread and tell the caller so they can
+                // build an audio-free FFmpeg command rather than pointing at a
+                // pipe that doesn't exist.
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                drop(thread); // don't join — it may be blocked on device open
+                eprintln!("[recorder audio] disabled: {e}");
+                Ok(None)
+            }
+        }
     }
 
     pub fn stop(&mut self) {
@@ -186,7 +208,7 @@ fn capture_loop(
     mic_device_id: Option<&str>,
     pipe_name_str: &str,
     stop:  &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ready: &std::sync::Arc<std::sync::Mutex<Option<AudioFormat>>>,
+    ready: &std::sync::Arc<std::sync::Mutex<Option<Result<AudioFormat, String>>>>,
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::ffi::OsStr;
@@ -237,11 +259,11 @@ fn capture_loop(
         h
     };
 
-    // Signal ready with our fixed pipe format
-    *ready.lock().unwrap() = Some(AudioFormat {
+    // Signal ready — pipe exists, FFmpeg can now open it as a client
+    *ready.lock().unwrap() = Some(Ok(AudioFormat {
         sample_rate: PIPE_SAMPLE_RATE,
         channels:    PIPE_CHANNELS,
-    });
+    }));
 
     // Start WASAPI clients BEFORE connecting the pipe so the kernel buffer
     // begins filling immediately. This avoids a silent gap at the start.

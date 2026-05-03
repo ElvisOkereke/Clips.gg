@@ -88,18 +88,37 @@ fn do_start_with_extra(
     let pipe = args.audio_pipe.clone()
         .unwrap_or_else(|| r"\\.\pipe\cliplite_sysaudio".to_string());
 
+    // effective_audio_cfg is set to None if audio failed to start,
+    // so the FFmpeg command is built without any audio input.
+    let effective_audio_cfg;
+
     #[cfg(windows)]
     {
         let sys_id = args.audio_cfg.sys_device_id.clone();
         let mic_id = args.audio_cfg.mic_device_id.clone();
         if sys_id.is_some() || mic_id.is_some() {
-            let result = audio::SysAudioCapture::start_with_pipe(sys_id, mic_id, pipe.clone());
-            match result {
-                Ok(cap) => rec.sys_audio = Some(cap),
-                Err(e)  => eprintln!("[recorder] audio failed: {e}"),
+            match audio::SysAudioCapture::start_with_pipe(sys_id, mic_id, pipe.clone()) {
+                Ok(Some(cap)) => {
+                    rec.sys_audio = Some(cap);
+                    effective_audio_cfg = args.audio_cfg.clone();
+                }
+                Ok(None) => {
+                    // Audio device failed — build FFmpeg command without audio
+                    eprintln!("[recorder] audio disabled (device failed), recording video only");
+                    effective_audio_cfg = AudioConfig { mic_device: None, sys_device_id: None, mic_device_id: None };
+                }
+                Err(e) => {
+                    eprintln!("[recorder] audio thread spawn failed: {e}");
+                    effective_audio_cfg = AudioConfig { mic_device: None, sys_device_id: None, mic_device_id: None };
+                }
             }
+        } else {
+            effective_audio_cfg = args.audio_cfg.clone();
         }
     }
+    #[cfg(not(windows))]
+    { effective_audio_cfg = args.audio_cfg.clone(); }
+
     let sys_fmt = {
         #[cfg(windows)]      { rec.sys_audio.as_ref().map(|c| c.format.clone()) }
         #[cfg(not(windows))] { None::<audio::AudioFormat> }
@@ -107,7 +126,7 @@ fn do_start_with_extra(
     let mut cmd_args = ffmpeg::build_record_command_with_pipe(
         std::path::Path::new(&args.ffmpeg_path),
         &args.region,
-        &args.audio_cfg,
+        &effective_audio_cfg,
         &args.enc_cfg,
         &args.output_path,
         sys_fmt.as_ref(),
@@ -129,18 +148,33 @@ fn do_start(rec: &mut recorder::RecorderInner, args: StartArgs) -> Result<String
     let pipe = args.audio_pipe.clone()
         .unwrap_or_else(|| r"\\.\pipe\cliplite_sysaudio".to_string());
 
+    let effective_audio_cfg;
+
     #[cfg(windows)]
     {
         let sys_id = args.audio_cfg.sys_device_id.clone();
         let mic_id = args.audio_cfg.mic_device_id.clone();
         if sys_id.is_some() || mic_id.is_some() {
-            let result = audio::SysAudioCapture::start_with_pipe(sys_id, mic_id, pipe.clone());
-            match result {
-                Ok(cap) => rec.sys_audio = Some(cap),
-                Err(e)  => eprintln!("[recorder] audio failed: {e}"),
+            match audio::SysAudioCapture::start_with_pipe(sys_id, mic_id, pipe.clone()) {
+                Ok(Some(cap)) => {
+                    rec.sys_audio = Some(cap);
+                    effective_audio_cfg = args.audio_cfg.clone();
+                }
+                Ok(None) => {
+                    eprintln!("[recorder] audio disabled (device failed), recording video only");
+                    effective_audio_cfg = AudioConfig { mic_device: None, sys_device_id: None, mic_device_id: None };
+                }
+                Err(e) => {
+                    eprintln!("[recorder] audio thread spawn failed: {e}");
+                    effective_audio_cfg = AudioConfig { mic_device: None, sys_device_id: None, mic_device_id: None };
+                }
             }
+        } else {
+            effective_audio_cfg = args.audio_cfg.clone();
         }
     }
+    #[cfg(not(windows))]
+    { effective_audio_cfg = args.audio_cfg.clone(); }
 
     let sys_fmt = {
         #[cfg(windows)]       { rec.sys_audio.as_ref().map(|c| c.format.clone()) }
@@ -150,7 +184,7 @@ fn do_start(rec: &mut recorder::RecorderInner, args: StartArgs) -> Result<String
     let cmd_args = ffmpeg::build_record_command_with_pipe(
         std::path::Path::new(&args.ffmpeg_path),
         &args.region,
-        &args.audio_cfg,
+        &effective_audio_cfg,
         &args.enc_cfg,
         &args.output_path,
         sys_fmt.as_ref(),
