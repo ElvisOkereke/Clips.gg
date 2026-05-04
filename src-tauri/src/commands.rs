@@ -217,6 +217,7 @@ fn spawn_recorder_isolated(
         pid:            pi.dwProcessId,
         stdin_write,
         stdout_read,
+        read_buf:       std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -538,12 +539,12 @@ pub async fn start_replay(
     {
         // Kill any existing replay child before starting a new one
         {
-            let mut rec = recorder.0.lock().unwrap();
-            if let Some(mut old) = rec.replay_child.take() {
-                old.send_line("{\"cmd\":\"stop_replay\"}").ok();
-                old.send_line("{\"cmd\":\"stop\"}").ok();
+            let old = recorder.0.lock().unwrap().replay_child.take();
+            if let Some(old_child) = old {
+                old_child.send_line("{\"cmd\":\"stop_replay\"}").ok();
+                old_child.send_line("{\"cmd\":\"stop\"}").ok();
                 std::thread::sleep(std::time::Duration::from_millis(150));
-                old.close_stdin();
+                // old_child drops here, closing all Win32 handles
             }
         }
 
@@ -588,7 +589,7 @@ pub async fn start_replay(
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
                 if v["event"] == "replay_started" {
                     let mut rec = recorder.0.lock().unwrap();
-                    rec.replay_child = Some(child);
+                    rec.replay_child = Some(std::sync::Arc::new(child));
                     return Ok("replay_started".into());
                 } else if v["event"] == "error" {
                     return Err(v["message"].as_str().unwrap_or("replay start failed").to_string());
@@ -605,14 +606,14 @@ pub async fn start_replay(
 pub async fn stop_replay(recorder: State<'_, RecorderState>) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let mut rec = recorder.0.lock().unwrap();
-        if let Some(mut child) = rec.replay_child.take() {
+        let child = recorder.0.lock().unwrap().replay_child.take();
+        if let Some(child) = child {
             child.send_line("{\"cmd\":\"stop_replay\"}").ok();
             child.send_line("{\"cmd\":\"stop\"}").ok();
-            // Brief pause so the subprocess can flush StopReplay event and clean temp file
+            // Brief pause so the subprocess can flush StopReplay event and clean temp file.
+            // Drop the Arc *after* the sleep so handles stay open during the flush.
             std::thread::sleep(std::time::Duration::from_millis(200));
-            child.close_stdin();
-            // child drops here — all Win32 handles closed via Drop
+            // child Arc drops here — Drop closes all Win32 handles including stdin (sends EOF)
             return Ok(());
         }
         return Err("Replay buffer not running".into());
@@ -628,6 +629,7 @@ pub async fn save_replay(
     secs:           u32,
     recorder:       State<'_, RecorderState>,
     settings_state: State<'_, SettingsState>,
+    encoder_cache:  State<'_, EncoderCache>,
 ) -> Result<String, String> {
     let settings   = settings_state.0.lock().unwrap().clone();
     let output_str = settings.build_replay_output_path(".mp4").to_string_lossy().to_string();
@@ -637,54 +639,135 @@ pub async fn save_replay(
         "secs": secs,
         "output_path": output_str,
     });
-
     let line = serde_json::to_string(&cmd).unwrap();
-    let rec  = recorder.0.lock().unwrap();
 
     #[cfg(windows)]
-    if let Some(child) = &rec.replay_child {
-        child.send_line(&line).map_err(|e| e.to_string())?;
-        // Loop until we receive replay_saved or error — intermediate lines
-        // (e.g. buffered status events) are discarded so we never miss the response.
-        loop {
-            let resp = match child.read_line() {
+    {
+        // ── Phase 1: send the command and read the response ──────────────────
+        // We MUST release the mutex lock before calling read_line() — the blocking
+        // read would hold the lock for the entire extraction duration (10-60+ seconds
+        // for long buffers), freezing any concurrent status polls or stop calls.
+        // Instead, Arc-clone the child so we can use it without holding the lock.
+        use std::sync::Arc;
+        let child_arc: Arc<crate::recorder::RecorderChild> = {
+            let rec = recorder.0.lock().unwrap();
+            match rec.replay_child.as_ref() {
+                Some(c) => Arc::clone(c),
+                None    => return Err("Replay buffer not active — start it first".into()),
+            }
+        }; // <-- lock released here
+
+        child_arc.send_line(&line).map_err(|e| e.to_string())?;
+
+        // Drain responses until we see replay_saved or error.
+        // The lock is NOT held here — other commands can run concurrently.
+        let saved_path = loop {
+            let resp = match child_arc.read_line() {
                 Some(r) => r,
-                None => return Err("Recorder process closed pipe unexpectedly".into()),
+                None    => return Err("Recorder process closed pipe unexpectedly".into()),
             };
             let v = match serde_json::from_str::<serde_json::Value>(&resp) {
-                Ok(v) => v,
-                Err(_) => continue, // malformed line — keep reading
+                Ok(v)  => v,
+                Err(_) => continue,
             };
             if v["event"] == "replay_saved" {
-                let path = v["path"].as_str().unwrap_or("").to_string();
-                let filename = std::path::Path::new(&path)
-                    .file_name().unwrap_or_default()
-                    .to_string_lossy().to_string();
-                // Emit event so the frontend toast appears
-                app.emit("replay-saved", &path).ok();
-                // Update tray tooltip so user sees confirmation even when minimised
-                if let Some(tray) = app.tray_by_id("main-tray") {
-                    let _ = tray.set_tooltip(Some(&format!("Replay saved: {filename}")));
-                }
-                // Fire OS notification so the user is notified even when the window is hidden
-                use tauri_plugin_notification::NotificationExt;
-                let _ = app.notification()
-                    .builder()
-                    .title("Replay saved")
-                    .body(&filename)
-                    .show();
-                return Ok(path);
+                break v["path"].as_str().unwrap_or("").to_string();
             } else if v["event"] == "error" {
                 return Err(v["message"].as_str().unwrap_or("save failed").to_string());
             }
-            // Any other event (e.g. "status") — skip and keep waiting
+            // status or other events — keep waiting
+        };
+
+        // ── Phase 2: replace the old child with a freshly started buffer ─────
+        // The subprocess cleared its own state after saving; we spawn a new
+        // subprocess so the user can save again without manually restarting.
+        let recorder_exe = find_recorder()
+            .ok_or_else(|| "cliplite-recorder.exe not found".to_string())?;
+        let ffmpeg_path = ffmpeg::find_ffmpeg().map_err(|e| e.to_string())?;
+        let cached_encoder = encoder_cache.inner().0.lock().unwrap().clone();
+        let hw_encoder = if cached_encoder.is_empty() { "h264_nvenc".into() } else { cached_encoder };
+
+        // Retrieve the original start args stored on the old child for replay config
+        // (region, audio, enc). We stored them in settings already.
+        // Build the start_replay JSON using those settings fields.
+        let restart_json = serde_json::json!({
+            "cmd": "start_replay",
+            "args": {
+                "ffmpeg_path": ffmpeg_path.to_string_lossy(),
+                "output_path": "",
+                "region": {
+                    "x": 0, "y": 0,
+                    "width": 1920, "height": 1080,
+                    "monitor": settings.selected_monitor
+                },
+                "audio_pipe": r"\\.\pipe\cliplite_sysaudio_replay",
+                "audio_cfg": {
+                    "mic_device":    null,
+                    "sys_device_id": settings.sys_audio_device_id,
+                    "mic_device_id": settings.mic_device_id,
+                },
+                "enc_cfg": {
+                    "fps": settings.default_fps,
+                    "quality_crf": settings.default_quality_crf,
+                    "format": settings.default_format,
+                    "hw_encoder": hw_encoder
+                },
+                "max_replay_buffer_size_mb": settings.max_replay_buffer_size_mb
+            }
+        });
+        let restart_line = serde_json::to_string(&restart_json).unwrap();
+
+        match spawn_recorder_isolated(&recorder_exe) {
+            Ok(new_child) => {
+                if new_child.send_line(&restart_line).is_ok() {
+                    // Wait for replay_started confirmation (with timeout via try_wait loop)
+                    let started = loop {
+                        match new_child.read_line() {
+                            None => break false,
+                            Some(resp) => {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                                    if v["event"] == "replay_started" { break true; }
+                                    if v["event"] == "error"          { break false; }
+                                }
+                            }
+                        }
+                    };
+                    let mut rec = recorder.0.lock().unwrap();
+                    if started {
+                        // Replace old child with new one — old child drops here, closing handles
+                        rec.replay_child = Some(Arc::new(new_child));
+                    } else {
+                        rec.replay_child = None;
+                    }
+                } else {
+                    recorder.0.lock().unwrap().replay_child = None;
+                }
+            }
+            Err(e) => {
+                log::warn!("[save_replay] Failed to restart replay buffer: {e}");
+                recorder.0.lock().unwrap().replay_child = None;
+            }
         }
+
+        // ── Phase 3: notify the UI ────────────────────────────────────────────
+        let filename = std::path::Path::new(&saved_path)
+            .file_name().unwrap_or_default()
+            .to_string_lossy().to_string();
+        app.emit("replay-saved", &saved_path).ok();
+        if let Some(tray) = app.tray_by_id("main-tray") {
+            let _ = tray.set_tooltip(Some(&format!("Replay saved: {filename}")));
+        }
+        use tauri_plugin_notification::NotificationExt;
+        let _ = app.notification()
+            .builder()
+            .title("Replay saved")
+            .body(&filename)
+            .show();
+        return Ok(saved_path);
     }
 
     #[cfg(not(windows))]
-    let _ = (line, rec);
-
-    Err("Recorder process not running".into())
+    Err("Replay buffer is only supported on Windows".into())
 }
 
 // ── Audio ─────────────────────────────────────────────────────────────────────

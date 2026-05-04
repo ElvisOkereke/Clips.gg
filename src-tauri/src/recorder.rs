@@ -21,6 +21,9 @@ pub struct RecorderChild {
     pub stdin_write:    windows::Win32::Foundation::HANDLE,
     /// Read end of stdout pipe — Tauri reads IPC events here
     pub stdout_read:    windows::Win32::Foundation::HANDLE,
+    /// Internal byte buffer for assembling complete newline-delimited lines
+    /// from the raw pipe. Wrapped in Mutex so read_line can take &self.
+    pub read_buf:       std::sync::Mutex<Vec<u8>>,
 }
 
 #[cfg(windows)]
@@ -50,17 +53,45 @@ impl RecorderChild {
         }
     }
 
-    /// Read one line from the recorder's stdout (blocking).
+    /// Read exactly one newline-terminated line from the recorder's stdout (blocking).
+    /// Accumulates bytes in an internal buffer so partial reads and multi-line
+    /// chunks (common when FFmpeg flushes large bursts) are handled correctly.
     pub fn read_line(&self) -> Option<String> {
         use windows::Win32::Storage::FileSystem::ReadFile;
-        let mut buf = vec![0u8; 4096];
-        let mut read = 0u32;
-        unsafe {
-            ReadFile(self.stdout_read, Some(&mut buf), Some(&mut read), None).ok()?;
+        let mut internal = self.read_buf.lock().unwrap();
+
+        loop {
+            // If we already have a complete line in the buffer, return it now.
+            if let Some(pos) = internal.iter().position(|&b| b == b'\n') {
+                let line_bytes = internal.drain(..=pos).collect::<Vec<u8>>();
+                let line = String::from_utf8_lossy(&line_bytes)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+                if !line.is_empty() {
+                    return Some(line);
+                }
+                continue; // skip blank lines, keep looking
+            }
+
+            // Need more bytes — read from the pipe.
+            let mut chunk = vec![0u8; 8192];
+            let mut read = 0u32;
+            let ok = unsafe {
+                ReadFile(self.stdout_read, Some(&mut chunk), Some(&mut read), None).is_ok()
+            };
+            if !ok || read == 0 {
+                // Pipe closed (process exited) — return whatever we have if non-empty.
+                if !internal.is_empty() {
+                    let remaining = String::from_utf8_lossy(&internal)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    internal.clear();
+                    if !remaining.is_empty() { return Some(remaining); }
+                }
+                return None;
+            }
+            internal.extend_from_slice(&chunk[..read as usize]);
         }
-        if read == 0 { return None; }
-        String::from_utf8(buf[..read as usize].to_vec()).ok()
-            .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
     }
 
     /// Non-blocking check if the process has exited. Returns Some(exit_code) if done.
@@ -166,7 +197,8 @@ pub struct RecorderInner {
 
     // Replay buffer subprocess — always a separate isolated process so stopping
     // recording never kills the replay buffer and vice versa.
-    pub replay_child: Option<RecorderChild>,
+    // Wrapped in Arc so save_replay can hold a reference without holding the mutex.
+    pub replay_child: Option<std::sync::Arc<RecorderChild>>,
 
     // Old std::process::Child path — kept only for status() check of fallback
     pub recorder_proc: Option<std::process::Child>,

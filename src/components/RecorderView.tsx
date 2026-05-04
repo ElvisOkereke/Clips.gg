@@ -281,8 +281,13 @@ export function RecorderView({ settings, hwEncoder, onStatus, onSettingsChange }
     try {
       const path = await saveReplay(secs);
       onStatus(path ? `Replay saved: ${path.split(/[/\\]/).pop()}` : "Replay saved.");
+      // Buffer is auto-restarted on the backend — keep replayActive=true optimistically.
+      // A status poll will correct it within 3s if restart actually failed.
+      setReplayActive(true);
     } catch (e: any) {
       onStatus(`Replay save error: ${e}`);
+      // On error the buffer state is unknown — let the status poll resolve it.
+      setReplayActive(false);
     } finally { setReplayBusy(false); }
   };
 

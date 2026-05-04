@@ -479,21 +479,27 @@ fn main() {
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
                     .creation_flags(CREATE_NO_WINDOW);
-                    
+
                     match cmd.spawn() {
                         Err(e) => { ffmpeg_stderr = format!("Failed to spawn FFmpeg: {e}"); false }
                         Ok(mut child) => {
-                            // Read stderr before waiting to avoid deadlock
-                            let stderr_content = if let Some(mut se) = child.stderr.take() {
-                                use std::io::Read;
-                                let mut buf = String::new();
-                                se.read_to_string(&mut buf).ok();
-                                buf
-                            } else {
-                                String::new()
-                            };
-                            ffmpeg_stderr = stderr_content;
-                            child.wait().map(|s| s.success()).unwrap_or(false)
+                            // Drain stderr on a background thread to prevent pipe-buffer
+                            // deadlock: FFmpeg blocks writing stderr → read_to_string never
+                            // returns → child.wait() never called → process never exits.
+                            let stderr_handle = child.stderr.take().map(|se| {
+                                std::thread::spawn(move || {
+                                    use std::io::Read;
+                                    let mut buf = String::new();
+                                    let mut se = se;
+                                    se.read_to_string(&mut buf).ok();
+                                    buf
+                                })
+                            });
+                            let success = child.wait().map(|s| s.success()).unwrap_or(false);
+                            ffmpeg_stderr = stderr_handle
+                                .and_then(|h| h.join().ok())
+                                .unwrap_or_default();
+                            success
                         }
                     }
                 };
